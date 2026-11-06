@@ -1,0 +1,4 @@
+PO_Number,VendorName,TotalAmount,Currency,IsActive
+PO-001,PT Maju Jaya,1200000,IDR,TRUE
+PO-002,PT Sukses Makmur,2500000,IDR,TRUE
+PO-003,PT Aman Sentosa,1500000,IDR,TRUE
