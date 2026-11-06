@@ -16,6 +16,10 @@ from src.intake import intake_directory
 from src.logging_setup import configure_logging
 from src.ocr import GoogleVisionClient, OcrError, extract_invoice_fields
 from src.po_validation import PoDataError, load_purchase_orders, validate_invoice
+from src.erp_posting import FormFields, GoogleFormsPoster, PostingError, PostingUncertain, validate_form_fields
+from src.export import export_all
+from src.archive import archive_final
+from src.preflight import run_preflight
 
 # Menentukan folder root proyek dari lokasi file main.py ini.
 ROOT = Path(__file__).resolve().parent
@@ -267,6 +271,62 @@ def check_email_connectivity() -> None:
     print("Email connectivity check passed: SMTP and IMAP authentication succeeded.")
 
 
+def post_to_erp() -> None:
+    """Post approval-final invoices once through visible Playwright browser."""
+    config = load_config(ROOT / "resources" / "Config.xlsx")
+    if "your-form-url" in config.forms_url:
+        raise ValueError("FormsUrl is still a placeholder; create Google Form first")
+    database = Database(ROOT / "data" / "automation.db"); database.initialise()
+    from playwright.sync_api import sync_playwright
+    timeout = int(os.getenv("ERP_BROWSER_TIMEOUT_MS", "30000"))
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=os.getenv("HEADLESS", "false").lower() == "true")
+        page = browser.new_page()
+        poster = GoogleFormsPoster(page, FormFields(), timeout)
+        for candidate in database.pending_erp_invoices():
+            invoice = database.reserve_posting(candidate["correlation_id"])
+            if not invoice: continue
+            database.set_posting_state(invoice["correlation_id"], "POSTING_IN_PROGRESS")
+            try:
+                poster.post(config.forms_url, invoice)
+                database.set_posting_state(invoice["correlation_id"], "POSTED")
+            except PostingUncertain as error:
+                database.set_posting_state(invoice["correlation_id"], "POSTING_UNCERTAIN", str(error))
+            except PostingError as error:
+                database.set_posting_state(invoice["correlation_id"], "POSTING_FAILED", str(error))
+        browser.close()
+
+
+def check_erp_form() -> None:
+    """Memvalidasi akses dan tujuh field Google Form tanpa submission atau input data."""
+    config = load_config(ROOT / "resources" / "Config.xlsx")
+    database = Database(ROOT / "data" / "automation.db"); database.initialise()
+    from playwright.sync_api import sync_playwright
+    timeout = int(os.getenv("ERP_BROWSER_TIMEOUT_MS", "30000"))
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        missing = validate_form_fields(page, config.forms_url, FormFields(), timeout)
+        browser.close()
+    if missing:
+        raise ValueError(f"Google Form missing required field label(s): {', '.join(missing)}")
+    print("ERP form connectivity check passed: all seven required labels are available.")
+
+def export_excel() -> None:
+    """Export SQLite source of truth ke tiga file Excel secara atomik."""
+    export_all(ROOT/'data'/'automation.db', ROOT/'resources', ROOT/'output'); print('Excel export complete: output/')
+
+def archive_invoices() -> None:
+    """Archive hanya invoice final tanpa mengubah state workflow."""
+    print(f"Archive complete: {archive_final(ROOT/'data'/'automation.db', ROOT/'data'/'processed')}")
+
+def preflight_check() -> None:
+    """Menjalankan audit readiness read-only tanpa network atau mutasi database."""
+    blockers, warnings = run_preflight(ROOT)
+    print('PREFLIGHT BLOCKERS: ' + ('none' if not blockers else '; '.join(blockers)))
+    print('PREFLIGHT WARNINGS: ' + ('none' if not warnings else '; '.join(warnings)))
+
+
 def parse_args() -> argparse.Namespace:
     """Define and parse commands accepted by the application."""
     # Membuat parser command-line utama.
@@ -296,6 +356,11 @@ def parse_args() -> argparse.Namespace:
     # Mendaftarkan pembacaan satu batch reply IMAP.
     subparsers.add_parser("approval-read-replies", help="read and apply one IMAP batch of approval replies")
     subparsers.add_parser("email-check", help="check SMTP/IMAP connectivity without sending email")
+    subparsers.add_parser("erp-post", help="post approved invoices through Google Forms")
+    subparsers.add_parser("erp-form-check", help="check Google Form fields without filling or submitting")
+    subparsers.add_parser("export-excel", help="export database to official Excel templates")
+    subparsers.add_parser("archive-invoices", help="archive final invoice files")
+    subparsers.add_parser("preflight-check", help="read-only deployment readiness audit")
     # Mengurai argument yang diketik pengguna dan mengembalikannya.
     return parser.parse_args()
 
@@ -336,6 +401,13 @@ def main() -> None:
             read_approval_replies()
         elif args.command == "email-check":
             check_email_connectivity()
+        elif args.command == "erp-post":
+            post_to_erp()
+        elif args.command == "erp-form-check":
+            check_erp_form()
+        elif args.command == "export-excel": export_excel()
+        elif args.command == "archive-invoices": archive_invoices()
+        elif args.command == "preflight-check": preflight_check()
     # Menangkap error konfigurasi dan credential dengan pesan yang mudah dipahami.
     except (ConfigError, OcrError, PoDataError, EmailConfigurationError, OSError, ValueError) as error:
         # Mengakhiri aplikasi dengan pesan ringkas, bukan traceback panjang.

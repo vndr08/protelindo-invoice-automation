@@ -2,6 +2,7 @@
 
 from pathlib import Path  # Mengelola path database temporary.
 import sqlite3  # Membuka SQLite untuk assertion state persistence.
+from contextlib import closing
 from tempfile import TemporaryDirectory  # Membuat storage test yang otomatis dibersihkan.
 import unittest  # Menggunakan framework test bawaan Python.
 
@@ -17,11 +18,12 @@ class DatabasePoValidationTests(unittest.TestCase):  # Mengelompokkan skenario a
             database.initialise()  # Membuat schema dan migrasi terkini.
             registration = InvoiceRegistration("correlation-1", "/tmp/invoice.jpg", "hash-1")  # Menyiapkan invoice minimal yang unik.
             self.assertTrue(database.register_invoice(registration))  # Menyimpan invoice inbound.
-            with sqlite3.connect(database_path) as connection:  # Membuka koneksi setup khusus test.
+            with closing(sqlite3.connect(database_path)) as connection:  # Membuka koneksi setup khusus test.
                 connection.execute("UPDATE invoices SET status = 'EXTRACTED' WHERE correlation_id = ?", (registration.correlation_id,))  # Menyiapkan invoice pada tahap PO.
+                connection.commit()
             result = ValidationResult("MATCHED", "Matched active PO: PO-001")  # Menyiapkan hasil validasi sukses.
             self.assertTrue(database.save_po_validation_result(registration.correlation_id, result))  # Menyimpan perubahan state pertama.
             self.assertFalse(database.save_po_validation_result(registration.correlation_id, result))  # Memastikan penyimpanan kedua di-skip.
-            with sqlite3.connect(database_path) as connection:  # Membuka koneksi untuk assertion audit.
+            with closing(sqlite3.connect(database_path)) as connection:  # Membuka koneksi untuk assertion audit.
                 log_count = connection.execute("SELECT COUNT(*) FROM process_logs WHERE step = 'PO_VALIDATION'").fetchone()[0]  # Menghitung log PO validation.
             self.assertEqual(log_count, 1)  # Memastikan hanya satu audit log yang dibuat.

@@ -6,6 +6,7 @@ from email.message import EmailMessage
 from pathlib import Path
 import re
 import sqlite3
+from contextlib import closing
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -58,22 +59,23 @@ class ApprovalWorkflowTests(unittest.TestCase):
         """Menyiapkan invoice dengan hasil PO validation untuk test berikutnya."""
         registration = InvoiceRegistration(correlation_id, f"/tmp/{correlation_id}.jpg", f"hash-{correlation_id}")
         self.assertTrue(self.database.register_invoice(registration))
-        with sqlite3.connect(self.database.path) as connection:
+        with closing(sqlite3.connect(self.database.path)) as connection:
             connection.execute(
                 """UPDATE invoices SET invoice_number = ?, vendor_name = ?, po_number = ?, amount = ?, currency = ?, status = ?
                 WHERE correlation_id = ?""",
                 ("INV-1", "PT Maju Jaya", "PO-001", amount, "IDR", status, correlation_id),
             )
+            connection.commit()
 
     def outbox_token(self) -> str:
         """Mengambil token test dari body outbox tanpa menaruh token pada log aplikasi."""
-        with sqlite3.connect(self.database.path) as connection:
+        with closing(sqlite3.connect(self.database.path)) as connection:
             body = connection.execute("SELECT body FROM approval_outbox").fetchone()[0]
         return re.search(r"Approval Token: ([A-Za-z0-9_-]+)", body).group(1)
 
     def invoice_state(self, correlation_id: str) -> tuple[str, str]:
         """Mengambil status workflow dan approval invoice untuk assertion."""
-        with sqlite3.connect(self.database.path) as connection:
+        with closing(sqlite3.connect(self.database.path)) as connection:
             return connection.execute("SELECT status, approval_status FROM invoices WHERE correlation_id = ?", (correlation_id,)).fetchone()
 
     def test_threshold_auto_approval_and_pending_email(self) -> None:
@@ -122,8 +124,9 @@ class ApprovalWorkflowTests(unittest.TestCase):
         malformed_message.set_content("Please approve this invoice")
         result = self.workflow.process_replies([("malformed", malformed_message.as_bytes())], self.approver)
         self.assertEqual(result, {"MALFORMED_REPLY": 1})
-        with sqlite3.connect(self.database.path) as connection:
+        with closing(sqlite3.connect(self.database.path)) as connection:
             connection.execute("UPDATE approval_requests SET expires_at = ?", ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),))
+            connection.commit()
         result = self.workflow.process_replies([("3", reply_bytes(self.approver, "REJECT", token))], self.approver)
         self.assertEqual(result, {"EXPIRED_TOKEN": 1})
         self.assertEqual(self.invoice_state("reject"), ("PENDING_APPROVAL", "PENDING_APPROVAL"))
@@ -136,7 +139,7 @@ class ApprovalWorkflowTests(unittest.TestCase):
         self.assertEqual(summary, {"auto_approved": 0, "pending": 1, "sent": 0, "failed": 1})
         self.assertEqual(self.invoice_state("smtp"), ("PENDING_APPROVAL", "PENDING_APPROVAL"))
         self.assertEqual(self.invoice_state("po-failed"), ("PO_VALIDATION_FAILED", "NOT_REQUIRED"))
-        with sqlite3.connect(self.database.path) as connection:
+        with closing(sqlite3.connect(self.database.path)) as connection:
             self.assertEqual(connection.execute("SELECT delivery_state FROM approval_outbox").fetchone()[0], "FAILED")
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM approval_outbox").fetchone()[0], 1)
         second_run = self.workflow.initiate(Decimal("1000000"), self.approver, 24, FakeMailer())

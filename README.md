@@ -103,6 +103,16 @@ python main.py approval-retry-delivery
 
 Messages left in `SENDING` are deliberately never resent automatically: SMTP cannot guarantee exactly-once delivery if a network failure occurs after the server accepts a message but before SQLite records `SENT`. Reconcile such messages manually before retrying to avoid duplicate email. Passwords and approval tokens are never logged; the outbox body temporarily holds the token until delivery, so protect the local SQLite file with normal device/storage controls.
 
+## Google Forms ERP simulation
+
+Create a Google Form with required short-answer fields: `PostingRef`, `CorrelationId`, `InvoiceNumber`, `VendorName`, `PO_Number`, `Amount`, and `Currency`. Put its responder URL into `FormsUrl` in `resources/Config.xlsx`, install `playwright`, then run `playwright install chromium` once and execute `python main.py erp-post`. A POSTED state requires Google Forms confirmation text; timeout after Submit becomes `POSTING_UNCERTAIN` and is never retried automatically. `POSTING_UNCERTAIN` must be reconciled against Form responses using the Posting Reference before any manual retry.
+
+Before any real submission, validate connectivity and labels only with `python main.py erp-form-check`. This command never fills a field or clicks Submit.
+
+## Export and archive
+
+Run `python main.py export-excel` to atomically rebuild `output/Invoices.xlsx`, `output/ERP_Dummy.xlsx`, and `output/ProcessLogs.xlsx` from SQLite. Run `python main.py archive-invoices` to move only final states: POSTED→success, REJECTED→rejected, PO_VALIDATION_FAILED→validation_failed, OCR_FAILED→review. Pending approval/posting records remain untouched. If an archive hash mismatches or file is missing, it remains unarchived and receives an audit log.
+
 ## Next milestones
 
 1. Local invoice intake and duplicate detection.
