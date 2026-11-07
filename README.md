@@ -32,6 +32,28 @@ python main.py ocr
 
 Place `.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff`, or `.pdf` invoice files in `data/incoming/`, then run `python main.py intake`. Each unique file is registered in SQLite with a correlation ID. Re-running intake (or adding a copy of the same file under another name) is safely logged as a duplicate.
 
+## IMAP invoice intake
+
+Invoice email intake is a finite, read-only IMAP batch. It uses UID plus UIDVALIDITY, `BODY.PEEK[]`, and never marks, moves, or deletes a message. Configure the mailbox in `.env` (an app password is recommended for Gmail):
+
+```env
+IMAP_HOST=imap.example.com
+IMAP_PORT=993
+IMAP_USERNAME=automation@example.com
+IMAP_PASSWORD=app-password
+IMAP_INTAKE_MAILBOX=INBOX
+IMAP_INTAKE_TIMEOUT_SECONDS=30
+IMAP_ATTACHMENT_MAX_BYTES=10485760
+```
+
+Run one batch manually or from a scheduler:
+
+```bash
+python main.py email-intake
+```
+
+Only JPEG/JPG and PNG attachments that pass filename, MIME type, signature, and size validation are admitted. The pipeline stores each attachment atomically, registers one content-unique invoice in `RECEIVED` state, then finalizes the attachment audit record. Re-running a UID or duplicate content is safe. A missing local durable file becomes `NEEDS_REFETCH` and is retried only when its original UID payload is available again; no unbounded polling or automatic retry loop is used.
+
 Add `GOOGLE_VISION_API_KEY` to your local `.env`, then run `python main.py ocr`. This processes invoices in `RECEIVED` status using Google Vision `TEXT_DETECTION`, then stores raw OCR text and regex-extracted invoice fields in SQLite. To retry known OCR failures after a network/configuration fix, run `python main.py ocr --retry-failed`. The current OCR command supports image files; PDF support will be added separately because it uses a different Google Vision flow.
 
 If only a regex pattern changes, run `python main.py reextract`. It reuses stored OCR text and therefore makes no Google Vision API calls.

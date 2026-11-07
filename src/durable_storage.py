@@ -1,12 +1,13 @@
 """Penyimpanan attachment durable untuk state DISCOVERED ke FILE_STORED."""
 from __future__ import annotations
 import hashlib, os, sqlite3, tempfile
+from contextlib import closing
 from pathlib import Path
 
 def store_attachment(database: Path, attachment_id: int, data: bytes, suffix: str, root: Path) -> Path:
     """Menulis file atomik, memverifikasi hash, lalu mengubah state database."""
     digest=hashlib.sha256(data).hexdigest()
-    with sqlite3.connect(database) as con:
+    with closing(sqlite3.connect(database)) as con:
         row=con.execute('SELECT sha256,storage_path FROM imap_attachments WHERE id=?',(attachment_id,)).fetchone()
         if not row: raise ValueError('attachment metadata not found')
         if row[0]!=digest: raise ValueError('attachment hash mismatch')
@@ -26,4 +27,5 @@ def store_attachment(database: Path, attachment_id: int, data: bytes, suffix: st
                 if temp and temp.exists(): temp.unlink()
                 raise
         con.execute("UPDATE imap_attachments SET storage_path=?,processing_status='FILE_STORED',error_reason=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",(str(target),attachment_id))
+        con.commit()
     return target

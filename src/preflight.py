@@ -1,6 +1,7 @@
 """Read-only deployment readiness checks; never call SMTP, IMAP, OCR, or Forms."""
 from __future__ import annotations
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from src.config import load_config
 
@@ -17,7 +18,7 @@ def run_preflight(root: Path) -> tuple[list[str], list[str]]:
     if not (root/'data'/'automation.db').exists(): blockers.append('Database belum diinisialisasi')
     else:
         try:
-            with sqlite3.connect(root/'data'/'automation.db') as con:
+            with closing(sqlite3.connect(root/'data'/'automation.db')) as con:
                 columns={r[1] for r in con.execute('PRAGMA table_info(invoices)')}
                 required={'correlation_id','posting_ref','posting_state','archive_path','approval_status'}
                 missing=required-columns

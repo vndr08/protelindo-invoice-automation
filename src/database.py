@@ -102,6 +102,14 @@ class Database:
             attachment_columns = {row[1] for row in connection.execute("PRAGMA table_info(imap_attachments)")}
             if attachment_columns and "invoice_id" not in attachment_columns:
                 connection.execute("ALTER TABLE imap_attachments ADD COLUMN invoice_id INTEGER")
+            if attachment_columns and "retry_count" not in attachment_columns:
+                connection.execute("ALTER TABLE imap_attachments ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+            if attachment_columns and "last_error_class" not in attachment_columns:
+                connection.execute("ALTER TABLE imap_attachments ADD COLUMN last_error_class TEXT")
+            if attachment_columns and "last_error_at" not in attachment_columns:
+                connection.execute("ALTER TABLE imap_attachments ADD COLUMN last_error_at TEXT")
+            if attachment_columns and "mime_type" not in attachment_columns:
+                connection.execute("ALTER TABLE imap_attachments ADD COLUMN mime_type TEXT")
             # Membuat tabel request approval; satu invoice hanya boleh memiliki satu request.
             connection.execute(
                 """
@@ -160,7 +168,7 @@ class Database:
                 UNIQUE(mailbox_identity, uidvalidity, uid))""")
             connection.execute("""CREATE TABLE IF NOT EXISTS imap_attachments (
                 id INTEGER PRIMARY KEY, message_db_id INTEGER NOT NULL, attachment_index INTEGER NOT NULL, original_filename TEXT,
-                sha256 TEXT NOT NULL, storage_path TEXT, invoice_id INTEGER, processing_status TEXT NOT NULL DEFAULT 'PENDING', error_reason TEXT,
+                sha256 TEXT NOT NULL, storage_path TEXT, mime_type TEXT, invoice_id INTEGER, processing_status TEXT NOT NULL DEFAULT 'PENDING', error_reason TEXT, retry_count INTEGER NOT NULL DEFAULT 0, last_error_class TEXT, last_error_at TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(message_db_id, attachment_index), FOREIGN KEY(message_db_id) REFERENCES imap_messages(id))""")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_imap_attachment_state ON imap_attachments(processing_status)")
@@ -178,16 +186,24 @@ class Database:
             except sqlite3.IntegrityError:
                 return None
 
-    def register_imap_attachment(self, message_db_id: int, attachment_index: int, original_filename: str | None, sha256: str, storage_path: str | None) -> bool:
+    def imap_message_id(self, mailbox: str, uidvalidity: str, uid: str) -> int | None:
+        """Mengambil ID message existing berdasarkan identity UID yang unik."""
+        with closing(sqlite3.connect(self.path)) as connection:
+            row=connection.execute("SELECT id FROM imap_messages WHERE mailbox_identity=? AND uidvalidity=? AND uid=?",(mailbox,uidvalidity,uid)).fetchone()
+            return row[0] if row else None
+
+    def register_imap_attachment(self, message_db_id: int, attachment_index: int, original_filename: str | None, sha256: str, storage_path: str | None, mime_type: str | None = None, initial_status: str = 'DISCOVERED', validation_reason: str | None = None) -> bool:
         """Menyimpan metadata attachment; uniqueness index mencegah duplikasi saat restart."""
+        if initial_status not in {'DISCOVERED','FAILED','PENDING'}: raise ValueError('invalid attachment initial status')
         with closing(sqlite3.connect(self.path)) as connection:
             try:
-                connection.execute("INSERT INTO imap_attachments(message_db_id,attachment_index,original_filename,sha256,storage_path) VALUES(?,?,?,?,?)",(message_db_id,attachment_index,original_filename,sha256,storage_path))
+                connection.execute("INSERT INTO imap_attachments(message_db_id,attachment_index,original_filename,sha256,storage_path,mime_type,processing_status,error_reason) VALUES(?,?,?,?,?,?,?,?)",(message_db_id,attachment_index,original_filename,sha256,storage_path,mime_type,initial_status,validation_reason))
+                connection.commit()
                 return True
             except sqlite3.IntegrityError:
                 return False
 
-    def register_stored_attachment_invoice(self, attachment_id: int) -> dict[str, Any]:
+    def register_stored_attachment_invoice(self, attachment_id: int, _after_invoice_insert: Any = None) -> dict[str, Any]:
         """Mendaftarkan FILE_STORED sebagai invoice RECEIVED secara atomik dan idempotent."""
         with closing(sqlite3.connect(self.path)) as connection:
             connection.row_factory = sqlite3.Row
@@ -207,25 +223,68 @@ class Database:
             existing = connection.execute("SELECT * FROM invoices WHERE file_hash=?", (attachment["sha256"],)).fetchone()
             if existing is None:
                 correlation_id = str(uuid4())
-                cursor = connection.execute("INSERT INTO invoices(correlation_id,file_path,file_hash,status) VALUES(?,?,?,'RECEIVED')", (correlation_id,str(path),attachment["sha256"]))
-                invoice_id = cursor.lastrowid
-                invoice = connection.execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+                try:
+                    cursor = connection.execute("INSERT INTO invoices(correlation_id,file_path,file_hash,status) VALUES(?,?,?,'RECEIVED')", (correlation_id,str(path),attachment["sha256"]))
+                    invoice_id = cursor.lastrowid
+                    invoice = connection.execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
+                    # Hook internal untuk membuktikan rollback; tidak berasal dari config/runtime user.
+                    if _after_invoice_insert:
+                        _after_invoice_insert()
+                except sqlite3.IntegrityError:
+                    # Worker lain telah memenangkan UNIQUE file_hash; gunakan record yang sama.
+                    invoice = connection.execute("SELECT * FROM invoices WHERE file_hash=?", (attachment["sha256"],)).fetchone()
+                    if invoice is None: raise
+                    invoice_id = invoice["id"]
             else:
                 invoice = existing; invoice_id = existing["id"]
             connection.execute("UPDATE imap_attachments SET invoice_id=?,processing_status='INVOICE_REGISTERED',updated_at=? WHERE id=?", (invoice_id,datetime.now(timezone.utc).isoformat(),attachment_id))
             self.add_log(connection, invoice["correlation_id"], "IMAP_INVOICE_REGISTRATION", "SUCCESS", "Stored attachment registered for OCR")
             return dict(invoice)
 
+    def finalize_imap_attachment(self, attachment_id: int) -> bool:
+        """Menandai attachment selesai hanya bila invoice relation valid; aman diulang."""
+        with closing(sqlite3.connect(self.path)) as connection:
+            row = connection.execute("SELECT invoice_id,processing_status FROM imap_attachments WHERE id=?", (attachment_id,)).fetchone()
+            if row is None or row[1] == "COMPLETED": return False
+            if row[1] != "INVOICE_REGISTERED" or not row[0]: raise ValueError("attachment is not ready for finalization")
+            if connection.execute("SELECT 1 FROM invoices WHERE id=?", (row[0],)).fetchone() is None: raise ValueError("invoice relation missing")
+            connection.execute("UPDATE imap_attachments SET processing_status='COMPLETED',updated_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(),attachment_id))
+            connection.commit(); return True
+
+    def recoverable_imap_attachments(self) -> list[dict[str, Any]]:
+        """Mengembalikan hanya state yang aman dilanjutkan; FAILED/COMPLETED di-skip."""
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.row_factory=sqlite3.Row
+            return [dict(r) for r in connection.execute("SELECT * FROM imap_attachments WHERE processing_status IN ('DISCOVERED','FILE_STORED','INVOICE_REGISTERED') ORDER BY id")]
+
     def update_imap_attachment(self, message_db_id: int, attachment_index: int, status: str, error: str | None = None) -> None:
         """Mencatat hasil processing attachment tanpa menghapus audit asal email."""
         with closing(sqlite3.connect(self.path)) as connection:
             connection.execute("UPDATE imap_attachments SET processing_status=?,error_reason=?,updated_at=? WHERE message_db_id=? AND attachment_index=?",(status,error,datetime.now(timezone.utc).isoformat(),message_db_id,attachment_index))
 
+    def record_imap_attachment_error(self, attachment_id: int, error_class: str, reason: str, status: str = 'FAILED') -> None:
+        """Mencatat klasifikasi error dan retry count secara atomik tanpa mengubah invoice."""
+        with closing(sqlite3.connect(self.path)) as connection:
+            now=datetime.now(timezone.utc).isoformat()
+            connection.execute("UPDATE imap_attachments SET processing_status=?,error_reason=?,last_error_class=?,last_error_at=?,retry_count=retry_count+1,updated_at=? WHERE id=?",(status,reason,error_class,now,now,attachment_id))
+            connection.commit()
+
+    def reactivate_needs_refetch_attachment(self, attachment_id: int) -> bool:
+        """Mengaktifkan kembali NEEDS_REFETCH hanya saat payload baru benar-benar tersedia."""
+        with closing(sqlite3.connect(self.path)) as connection:
+            cursor=connection.execute(
+                "UPDATE imap_attachments SET processing_status='DISCOVERED',error_reason=NULL,updated_at=? "
+                "WHERE id=? AND processing_status='NEEDS_REFETCH'",
+                (datetime.now(timezone.utc).isoformat(),attachment_id),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+
     def pending_imap_attachments(self) -> list[dict[str, Any]]:
         """Mengambil attachment pending/failed untuk recovery adapter tahap berikutnya."""
         with closing(sqlite3.connect(self.path)) as connection:
             connection.row_factory=sqlite3.Row
-            return [dict(row) for row in connection.execute("SELECT a.*,m.mailbox_identity,m.uidvalidity,m.uid FROM imap_attachments a JOIN imap_messages m ON m.id=a.message_db_id WHERE a.processing_status IN ('PENDING','FAILED') ORDER BY a.id")]
+            return [dict(row) for row in connection.execute("SELECT a.*,m.mailbox_identity,m.uidvalidity,m.uid FROM imap_attachments a JOIN imap_messages m ON m.id=a.message_db_id WHERE a.processing_status IN ('PENDING','FAILED','NEEDS_REFETCH') ORDER BY a.id")]
 
     def register_invoice(self, invoice: InvoiceRegistration) -> bool:
         """Insert an inbound invoice. Returns False when its content already exists."""

@@ -1,6 +1,7 @@
 """Export database state to the official Excel assessment templates."""
 from __future__ import annotations
 import os, sqlite3, tempfile
+from contextlib import closing
 from pathlib import Path
 from openpyxl import load_workbook
 
@@ -23,7 +24,7 @@ def _atomic_workbook(template: Path, output: Path, rows: list[tuple]) -> None:
 def export_all(database_path: Path, resources: Path, output: Path) -> None:
     """Export seluruh invoice, hanya ERP POSTED, dan seluruh process log dari SQLite."""
     try:
-        with sqlite3.connect(database_path) as connection:
+        with closing(sqlite3.connect(database_path)) as connection:
             invoices = connection.execute("SELECT correlation_id,file_path,invoice_number,vendor_name,po_number,amount,currency,match_status,needs_approval,approval_status,posting_ref,posted_at,status,created_at,updated_at FROM invoices ORDER BY id").fetchall()
             posted = connection.execute("SELECT invoice_number,vendor_name,po_number,amount,currency,posted_at,approval_status,posting_ref,posted_at FROM invoices WHERE posting_state='POSTED' ORDER BY id").fetchall()
             logs = connection.execute("SELECT created_at,correlation_id,step,result,message FROM process_logs ORDER BY id").fetchall()

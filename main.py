@@ -20,6 +20,8 @@ from src.erp_posting import FormFields, GoogleFormsPoster, PostingError, Posting
 from src.export import export_all
 from src.archive import archive_final
 from src.preflight import run_preflight
+from src.imap_adapter import ReadOnlyImapAdapter
+from src.email_intake import run_email_intake
 
 # Menentukan folder root proyek dari lokasi file main.py ini.
 ROOT = Path(__file__).resolve().parent
@@ -78,6 +80,32 @@ def intake() -> None:
         f"{summary.registered} registered, {summary.duplicates} duplicate(s), "
         f"{summary.unsupported} unsupported file(s)."
     )
+
+
+def email_intake() -> None:
+    """Mengambil satu batch invoice IMAP secara read-only sampai siap OCR."""
+    load_dotenv(ROOT / '.env')
+    logger=configure_logging(ROOT)
+    def required(name: str) -> str:
+        value=os.getenv(name,'').strip()
+        if not value: raise EmailConfigurationError(f'{name} is missing; add it to .env')
+        return value
+    host=required('IMAP_HOST'); username=required('IMAP_USERNAME'); password=required('IMAP_PASSWORD')
+    try:
+        port=int(os.getenv('IMAP_PORT','993'))
+        timeout=int(os.getenv('IMAP_INTAKE_TIMEOUT_SECONDS','30'))
+        max_bytes=int(os.getenv('IMAP_ATTACHMENT_MAX_BYTES','10485760'))
+    except ValueError as error:
+        raise EmailConfigurationError('IMAP port, timeout, and attachment size must be integers') from error
+    if port < 1 or timeout < 1 or max_bytes < 1:
+        raise EmailConfigurationError('IMAP port, timeout, and attachment size must be positive')
+    mailbox=os.getenv('IMAP_INTAKE_MAILBOX','INBOX').strip() or 'INBOX'
+    # Identity mencakup mailbox dan username untuk mencegah collision antar akun.
+    mailbox_identity=f'{username}:{mailbox}'
+    adapter=ReadOnlyImapAdapter(host,port,username,password,mailbox,timeout)
+    summary=run_email_intake(adapter,mailbox_identity,ROOT/'data'/'automation.db',ROOT/'data'/'incoming',max_bytes)
+    logger.info('email_intake_complete=%s',json.dumps(summary,sort_keys=True))
+    print(f"Email intake complete: {json.dumps(summary,sort_keys=True)}")
 
 
 def run_ocr(retry_failed: bool = False) -> None:
@@ -339,6 +367,7 @@ def parse_args() -> argparse.Namespace:
     subparsers.add_parser("status", help="show local database status")
     # Mendaftarkan command pembacaan invoice lokal.
     subparsers.add_parser("intake", help="register invoice images from data/incoming")
+    subparsers.add_parser("email-intake", help="read one IMAP invoice batch without changing mailbox flags")
     # Membuat parser khusus untuk command OCR.
     ocr_parser = subparsers.add_parser("ocr", help="run Google Vision OCR and regex extraction")
     # Mengizinkan retry eksplisit untuk invoice yang sebelumnya berstatus OCR_FAILED.
@@ -380,6 +409,8 @@ def main() -> None:
         # Menjalankan intake bila command adalah intake.
         elif args.command == "intake":
             intake()
+        elif args.command == "email-intake":
+            email_intake()
         # Menjalankan OCR dan ekstraksi bila command adalah ocr.
         elif args.command == "ocr":
             # Mengirim pilihan retry yang diketik pengguna ke workflow OCR.
