@@ -3,13 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from email import policy
 from email.parser import BytesParser
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 from src.attachment_validation import ALLOWED, SIGNATURES
 from src.durable_storage import store_attachment
 from src.imap_adapter import ImapMessage, ReadOnlyImapAdapter
 from src.imap_recovery import classify_recovery_error, recover
 from pathlib import Path
 from src.database import Database
+from src.time_utils import UTC
 import hashlib, logging, sqlite3
 from contextlib import closing
 
@@ -33,7 +34,7 @@ def parse_email_attachments(raw: bytes, max_bytes: int) -> tuple[EmailMetadata, 
         message=BytesParser(policy=policy.default).parsebytes(raw)
     except Exception as error:
         raise ValueError('malformed MIME message') from error
-    metadata=EmailMetadata(message.get('Message-ID'),parseaddr(message.get('From',''))[1],str(message.get('Subject','')),message.get('Date'))
+    metadata=EmailMetadata(message.get('Message-ID'),parseaddr(message.get('From',''))[1],str(message.get('Subject','')),_canonical_email_date(message.get('Date')))
     result=[]; index=0
     for part in message.walk():
         if part.is_multipart() or part.get_content_disposition() != 'attachment': continue
@@ -45,6 +46,19 @@ def parse_email_attachments(raw: bytes, max_bytes: int) -> tuple[EmailMetadata, 
         elif not payload or len(payload)>max_bytes or not payload.startswith(SIGNATURES[extension]): error='empty, oversized, or corrupt attachment'
         result.append(ExtractedAttachment(index,filename,mime,payload,error)); index+=1
     return metadata,result
+
+
+def _canonical_email_date(value: str | None) -> str | None:
+    """Mengonversi Date RFC 2822 email ke UTC ISO-8601; tanggal ambigu disimpan kosong."""
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            return None  # Date tanpa offset tidak boleh diasumsikan sebagai WIB/UTC secara diam-diam.
+        return parsed.astimezone(UTC).isoformat(timespec='seconds')
+    except (TypeError, ValueError, IndexError):
+        return None
 
 def register_parsed_email(raw: bytes, mailbox_identity: str, uidvalidity: str, uid: str, db_path: Path, max_bytes: int) -> tuple[int, EmailMetadata, list[ExtractedAttachment]]:
     """Memparse dan mendaftarkan message UID sekali tanpa menyimpan attachment/file."""

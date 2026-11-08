@@ -4,6 +4,8 @@ import hashlib, shutil, sqlite3
 from contextlib import closing
 from pathlib import Path
 
+from src.time_utils import utc_now_iso
+
 def _hash(path: Path) -> str:
     digest=hashlib.sha256()
     with path.open('rb') as file:
@@ -27,9 +29,10 @@ def archive_final(database_path: Path, root: Path) -> dict[str,int]:
                 target.parent.mkdir(parents=True,exist_ok=True)
                 if target.exists() and _hash(target)!=file_hash: target=target.with_name(f'{source.stem}-{file_hash[:8]}{source.suffix}')
                 if not target.exists(): shutil.move(str(source),str(target))
-                connection.execute("UPDATE invoices SET archive_path=?, archive_hash=? WHERE correlation_id=?",(str(target),file_hash,correlation_id))
-                connection.execute("INSERT INTO process_logs(correlation_id,step,result,message) VALUES(?,?,?,?)",(correlation_id,'ARCHIVE','SUCCESS',str(target))); result['archived']+=1
+                now = utc_now_iso()
+                connection.execute("UPDATE invoices SET archive_path=?, archive_hash=?, updated_at=? WHERE correlation_id=?",(str(target),file_hash,now,correlation_id))
+                connection.execute("INSERT INTO process_logs(correlation_id,step,result,message,created_at) VALUES(?,?,?,?,?)",(correlation_id,'ARCHIVE','SUCCESS',str(target),now)); result['archived']+=1
             except Exception as error:
-                connection.execute("INSERT INTO process_logs(correlation_id,step,result,message) VALUES(?,?,?,?)",(correlation_id,'ARCHIVE','FAILED',type(error).__name__)); result['failed']+=1
+                connection.execute("INSERT INTO process_logs(correlation_id,step,result,message,created_at) VALUES(?,?,?,?,?)",(correlation_id,'ARCHIVE','FAILED',type(error).__name__,utc_now_iso())); result['failed']+=1
         connection.commit()
     return result

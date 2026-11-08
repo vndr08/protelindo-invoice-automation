@@ -6,11 +6,13 @@ import hashlib
 import secrets
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+from src.time_utils import parse_utc_timestamp, utc_now, utc_now_iso
 
 
 class _TransactionClosing:
@@ -66,6 +68,7 @@ class Database:
                     posted_at TEXT,
                     status TEXT NOT NULL DEFAULT 'RECEIVED',
                     ocr_text TEXT,
+                    -- Default legacy dipertahankan untuk database lama/manual SQL; semua write aplikasi mengirim UTC ISO +00:00 eksplisit.
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
@@ -180,7 +183,8 @@ class Database:
         """Mendaftarkan identity email sekali; None berarti message sudah pernah terlihat."""
         with closing(sqlite3.connect(self.path)) as connection:
             try:
-                cursor=connection.execute("INSERT INTO imap_messages(mailbox_identity,uidvalidity,uid,message_id,sender,subject,received_at) VALUES(?,?,?,?,?,?,?)",(mailbox,uidvalidity,uid,message_id,sender,subject,received_at))
+                now = utc_now_iso()
+                cursor=connection.execute("INSERT INTO imap_messages(mailbox_identity,uidvalidity,uid,message_id,sender,subject,received_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(mailbox,uidvalidity,uid,message_id,sender,subject,received_at,now,now))
                 return cursor.lastrowid
             except sqlite3.IntegrityError:
                 return None
@@ -196,7 +200,8 @@ class Database:
         if initial_status not in {'DISCOVERED','FAILED','PENDING'}: raise ValueError('invalid attachment initial status')
         with closing(sqlite3.connect(self.path)) as connection:
             try:
-                connection.execute("INSERT INTO imap_attachments(message_db_id,attachment_index,original_filename,sha256,storage_path,mime_type,processing_status,error_reason) VALUES(?,?,?,?,?,?,?,?)",(message_db_id,attachment_index,original_filename,sha256,storage_path,mime_type,initial_status,validation_reason))
+                now = utc_now_iso()
+                connection.execute("INSERT INTO imap_attachments(message_db_id,attachment_index,original_filename,sha256,storage_path,mime_type,processing_status,error_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",(message_db_id,attachment_index,original_filename,sha256,storage_path,mime_type,initial_status,validation_reason,now,now))
                 connection.commit()
                 return True
             except sqlite3.IntegrityError:
@@ -223,7 +228,8 @@ class Database:
             if existing is None:
                 correlation_id = str(uuid4())
                 try:
-                    cursor = connection.execute("INSERT INTO invoices(correlation_id,file_path,file_hash,status) VALUES(?,?,?,'RECEIVED')", (correlation_id,str(path),attachment["sha256"]))
+                    now = utc_now_iso()
+                    cursor = connection.execute("INSERT INTO invoices(correlation_id,file_path,file_hash,status,created_at,updated_at) VALUES(?,?,?,'RECEIVED',?,?)", (correlation_id,str(path),attachment["sha256"],now,now))
                     invoice_id = cursor.lastrowid
                     invoice = connection.execute("SELECT * FROM invoices WHERE id=?", (invoice_id,)).fetchone()
                     # Hook internal untuk membuktikan rollback; tidak berasal dari config/runtime user.
@@ -236,7 +242,7 @@ class Database:
                     invoice_id = invoice["id"]
             else:
                 invoice = existing; invoice_id = existing["id"]
-            connection.execute("UPDATE imap_attachments SET invoice_id=?,processing_status='INVOICE_REGISTERED',updated_at=? WHERE id=?", (invoice_id,datetime.now(timezone.utc).isoformat(),attachment_id))
+            connection.execute("UPDATE imap_attachments SET invoice_id=?,processing_status='INVOICE_REGISTERED',updated_at=? WHERE id=?", (invoice_id,utc_now_iso(),attachment_id))
             self.add_log(connection, invoice["correlation_id"], "IMAP_INVOICE_REGISTRATION", "SUCCESS", "Stored attachment registered for OCR")
             return dict(invoice)
 
@@ -247,7 +253,7 @@ class Database:
             if row is None or row[1] == "COMPLETED": return False
             if row[1] != "INVOICE_REGISTERED" or not row[0]: raise ValueError("attachment is not ready for finalization")
             if connection.execute("SELECT 1 FROM invoices WHERE id=?", (row[0],)).fetchone() is None: raise ValueError("invoice relation missing")
-            connection.execute("UPDATE imap_attachments SET processing_status='COMPLETED',updated_at=? WHERE id=?", (datetime.now(timezone.utc).isoformat(),attachment_id))
+            connection.execute("UPDATE imap_attachments SET processing_status='COMPLETED',updated_at=? WHERE id=?", (utc_now_iso(),attachment_id))
             connection.commit(); return True
 
     def recoverable_imap_attachments(self) -> list[dict[str, Any]]:
@@ -259,12 +265,12 @@ class Database:
     def update_imap_attachment(self, message_db_id: int, attachment_index: int, status: str, error: str | None = None) -> None:
         """Mencatat hasil processing attachment tanpa menghapus audit asal email."""
         with closing(sqlite3.connect(self.path)) as connection:
-            connection.execute("UPDATE imap_attachments SET processing_status=?,error_reason=?,updated_at=? WHERE message_db_id=? AND attachment_index=?",(status,error,datetime.now(timezone.utc).isoformat(),message_db_id,attachment_index))
+            connection.execute("UPDATE imap_attachments SET processing_status=?,error_reason=?,updated_at=? WHERE message_db_id=? AND attachment_index=?",(status,error,utc_now_iso(),message_db_id,attachment_index))
 
     def record_imap_attachment_error(self, attachment_id: int, error_class: str, reason: str, status: str = 'FAILED') -> None:
         """Mencatat klasifikasi error dan retry count secara atomik tanpa mengubah invoice."""
         with closing(sqlite3.connect(self.path)) as connection:
-            now=datetime.now(timezone.utc).isoformat()
+            now=utc_now_iso()
             connection.execute("UPDATE imap_attachments SET processing_status=?,error_reason=?,last_error_class=?,last_error_at=?,retry_count=retry_count+1,updated_at=? WHERE id=?",(status,reason,error_class,now,now,attachment_id))
             connection.commit()
 
@@ -274,7 +280,7 @@ class Database:
             cursor=connection.execute(
                 "UPDATE imap_attachments SET processing_status='DISCOVERED',error_reason=NULL,updated_at=? "
                 "WHERE id=? AND processing_status='NEEDS_REFETCH'",
-                (datetime.now(timezone.utc).isoformat(),attachment_id),
+                (utc_now_iso(),attachment_id),
             )
             connection.commit()
             return cursor.rowcount == 1
@@ -291,10 +297,10 @@ class Database:
             with closing(sqlite3.connect(self.path)) as connection:
                 connection.execute(
                     """
-                    INSERT INTO invoices (correlation_id, file_path, file_hash, status)
-                    VALUES (?, ?, ?, 'RECEIVED')
+                    INSERT INTO invoices (correlation_id, file_path, file_hash, status, created_at, updated_at)
+                    VALUES (?, ?, ?, 'RECEIVED', ?, ?)
                     """,
-                    (invoice.correlation_id, invoice.file_path, invoice.file_hash),
+                    (invoice.correlation_id, invoice.file_path, invoice.file_hash, utc_now_iso(), utc_now_iso()),
                 )
                 self.add_log(
                     connection,
@@ -317,10 +323,10 @@ class Database:
     ) -> None:
         connection.execute(
             """
-            INSERT INTO process_logs (correlation_id, step, result, message)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO process_logs (correlation_id, step, result, message, created_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (correlation_id, step, result, message),
+            (correlation_id, step, result, message, utc_now_iso()),
         )
 
     def log_event(self, correlation_id: str | None, step: str, result: str, message: str) -> None:
@@ -354,7 +360,7 @@ class Database:
     def save_ocr_result(self, correlation_id: str, ocr_text: str, extracted: Any) -> None:
         """Persist raw OCR text and regex fields for one successful invoice."""
         # Membuat timestamp UTC yang eksplisit untuk audit trail.
-        updated_at = datetime.now(timezone.utc).isoformat()
+        updated_at = utc_now_iso()
         # Membuka transaksi SQLite untuk pembaruan invoice dan audit log.
         with closing(sqlite3.connect(self.path)) as connection:
             # Menyimpan output OCR, field hasil regex, dan status tahap OCR.
@@ -382,7 +388,7 @@ class Database:
     def mark_ocr_failed(self, correlation_id: str, message: str) -> None:
         """Mark a failed OCR attempt without losing the original inbound invoice."""
         # Membuat timestamp UTC untuk perubahan status error.
-        updated_at = datetime.now(timezone.utc).isoformat()
+        updated_at = utc_now_iso()
         # Membuka transaksi untuk mengubah status dan menyimpan audit error.
         with closing(sqlite3.connect(self.path)) as connection:
             # Menandai invoice supaya tidak diproses ulang diam-diam pada run berikutnya.
@@ -425,7 +431,7 @@ class Database:
     def save_po_validation_result(self, correlation_id: str, result: Any) -> bool:
         """Persist one PO result atomically and return False when it was already handled."""
         # Membuat timestamp UTC yang eksplisit untuk audit validation.
-        validated_at = datetime.now(timezone.utc).isoformat()
+        validated_at = utc_now_iso()
         # Menetapkan status workflow berdasarkan hasil validator.
         workflow_status = "PO_VALIDATED" if result.is_valid else "PO_VALIDATION_FAILED"
         # Menetapkan hasil structured log berdasarkan sukses atau gagal.
@@ -475,7 +481,7 @@ class Database:
 
     def reserve_posting(self, correlation_id: str) -> dict[str, Any] | None:
         """Membuat PostingRef persisten sebelum browser membuka form."""
-        now = datetime.now(timezone.utc).isoformat()
+        now = utc_now_iso()
         with closing(sqlite3.connect(self.path)) as connection:
             connection.row_factory = sqlite3.Row
             # Guard kedua di transaksi mencegah invoice APPROVED yang tidak memiliki
@@ -524,7 +530,7 @@ class Database:
             }
             if dry_run:
                 return result
-            now = datetime.now(timezone.utc).isoformat()
+            now = utc_now_iso()
             changed = connection.execute(
                 """UPDATE invoices SET posting_state = 'NOT_POSTED', posting_error = NULL, updated_at = ?
                    WHERE id = ? AND status = 'APPROVED'
@@ -578,7 +584,7 @@ class Database:
             }
             if dry_run:
                 return result
-            now = datetime.now(timezone.utc).isoformat()
+            now = utc_now_iso()
             changed = connection.execute(
                 """UPDATE invoices
                    SET posting_state = 'POSTED', posting_error = NULL, posted_at = ?, updated_at = ?
@@ -602,13 +608,14 @@ class Database:
     def set_posting_state(self, correlation_id: str, state: str, error: str | None = None) -> None:
         """Menyimpan state posting dan audit tanpa mengubah decision approval."""
         with closing(sqlite3.connect(self.path)) as connection:
-            connection.execute("UPDATE invoices SET posting_state = ?, posting_error = ?, posted_at = CASE WHEN ? = 'POSTED' THEN ? ELSE posted_at END, updated_at = ? WHERE correlation_id = ?", (state, error, state, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat(), correlation_id))
+            now = utc_now_iso()
+            connection.execute("UPDATE invoices SET posting_state = ?, posting_error = ?, posted_at = CASE WHEN ? = 'POSTED' THEN ? ELSE posted_at END, updated_at = ? WHERE correlation_id = ?", (state, error, state, now, now, correlation_id))
             self.add_log(connection, correlation_id, "ERP_POSTING", state, error or state)
 
     def prepare_approval(self, invoice: dict[str, Any], threshold: Any, approver_email: str, ttl_hours: int) -> dict[str, str] | None:
         """Atomically auto-approve or create a pending request and durable outbox entry."""
-        now = datetime.now(timezone.utc)
-        now_text = now.isoformat()
+        now = utc_now()
+        now_text = now.isoformat(timespec="seconds")
         with closing(sqlite3.connect(self.path)) as connection:
             amount = invoice["amount"]
             if amount <= threshold:
@@ -623,7 +630,7 @@ class Database:
                 return {"action": "AUTO_APPROVED"}
             token = secrets.token_urlsafe(32)
             token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
-            expires_at = (now + timedelta(hours=ttl_hours)).isoformat()
+            expires_at = (now + timedelta(hours=ttl_hours)).isoformat(timespec="seconds")
             cursor = connection.execute(
                 """UPDATE invoices SET needs_approval = 1, approval_status = 'PENDING_APPROVAL', status = 'PENDING_APPROVAL', updated_at = ?
                 WHERE correlation_id = ? AND status = 'PO_VALIDATED' AND approval_status = 'NOT_REQUIRED'""",
@@ -686,7 +693,7 @@ class Database:
 
     def mark_outbox_sent(self, outbox_id: int) -> bool:
         """Mark a successfully submitted SMTP message sent exactly once."""
-        now_text = datetime.now(timezone.utc).isoformat()
+        now_text = utc_now_iso()
         with closing(sqlite3.connect(self.path)) as connection:
             row = connection.execute(
                 "SELECT r.correlation_id FROM approval_outbox o JOIN approval_requests r ON r.id = o.approval_request_id WHERE o.id = ?",
@@ -708,8 +715,8 @@ class Database:
 
     def record_approval_reply(self, mailbox_uid: str, sender_email: str, token: str | None, decision: str | None, approver_email: str) -> str:
         """Validate and apply one reply atomically; duplicate UID/decision causes no state change."""
-        now = datetime.now(timezone.utc)
-        now_text = now.isoformat()
+        now = utc_now()
+        now_text = now.isoformat(timespec="seconds")
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest() if token else None
         with closing(sqlite3.connect(self.path)) as connection:
             existing = connection.execute("SELECT 1 FROM approval_receipts WHERE mailbox_uid = ?", (mailbox_uid,)).fetchone()
@@ -722,7 +729,7 @@ class Database:
             request = connection.execute("SELECT * FROM approval_requests WHERE token_hash = ?", (token_hash,)).fetchone()
             if request is None:
                 return self._save_receipt(connection, mailbox_uid, sender_email, "INVALID_TOKEN", "Token does not match an approval request", now_text)
-            if datetime.fromisoformat(request[5]) <= now:
+            if parse_utc_timestamp(request[5]) <= now:
                 return self._save_receipt(connection, mailbox_uid, sender_email, "EXPIRED_TOKEN", "Approval token has expired", now_text)
             if request[6] is not None:
                 return self._save_receipt(connection, mailbox_uid, sender_email, "DUPLICATE_DECISION", "Approval request is already decided", now_text)

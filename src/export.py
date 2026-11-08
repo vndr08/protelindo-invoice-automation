@@ -5,7 +5,31 @@ from contextlib import closing
 from pathlib import Path
 from openpyxl import load_workbook
 
+from src.time_utils import excel_wib_datetime
+
 class ExportError(RuntimeError): pass
+
+
+_TIMESTAMP_HEADERS = {"PostedAt", "CreatedAt", "UpdatedAt", "PostingDate", "SubmittedAt", "Timestamp"}
+_EXCEL_WIB_FORMAT = 'yyyy-mm-dd hh:mm:ss "WIB"'
+
+
+def _append_rows_with_wib_timestamps(sheet: object, rows: list[tuple]) -> None:
+    """Menulis timestamp sebagai datetime Excel lokal WIB agar sorting tetap kronologis."""
+    if not rows:
+        return  # Tidak perlu membaca header pada export kosong; juga menjaga mock atomic-export lama.
+    headers = [cell.value for cell in sheet[1]]
+    timestamp_columns = {index for index, header in enumerate(headers) if header in _TIMESTAMP_HEADERS}
+    for row in rows:
+        values = list(row)
+        for index in timestamp_columns:
+            if index < len(values):
+                values[index] = excel_wib_datetime(values[index])  # None tetap kosong, bukan tanggal palsu.
+        sheet.append(values)
+        for index in timestamp_columns:
+            cell = sheet.cell(row=sheet.max_row, column=index + 1)
+            if cell.value is not None:
+                cell.number_format = _EXCEL_WIB_FORMAT  # Excel tidak menyimpan timezone; suffix memberi konteks WIB.
 
 def _atomic_workbook(template: Path, output: Path, rows: list[tuple]) -> None:
     """Menulis ulang data dari template ke temporary file lalu replace secara atomik."""
@@ -15,7 +39,7 @@ def _atomic_workbook(template: Path, output: Path, rows: list[tuple]) -> None:
         workbook = load_workbook(template)
         sheet = workbook.active
         if sheet.max_row > 1: sheet.delete_rows(2, sheet.max_row - 1)
-        for row in rows: sheet.append(row)
+        _append_rows_with_wib_timestamps(sheet, rows)
         output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=output.parent, suffix='.xlsx', delete=False) as temp:
             temporary = Path(temp.name)

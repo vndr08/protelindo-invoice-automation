@@ -10,6 +10,7 @@ from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
 from src.database import Database
+from src.time_utils import utc_now_iso
 
 
 FIXTURE_INVOICE_NUMBER = "ERP-AUTO-TEST-001"
@@ -37,12 +38,13 @@ def prepare_erp_auto_test_fixture(database_path: Path, storage_dir: Path, fixtur
             "SELECT * FROM invoices WHERE correlation_id = ?", (correlation_id,)
         ).fetchone()
         if existing is None:
+            now = utc_now_iso()
             connection.execute(
                 """INSERT INTO invoices(correlation_id, file_path, file_hash, invoice_number,
-                   vendor_name, po_number, amount, currency, status, approval_status, posting_state)
+                   vendor_name, po_number, amount, currency, status, approval_status, posting_state, created_at, updated_at)
                    VALUES (?, ?, ?, ?, 'PT ERP Automation Test', 'ERP-AUTO-PO-001', '1000', 'IDR',
-                   'APPROVED', 'APPROVED', 'NOT_POSTED')""",
-                (correlation_id, str(attachment), file_hash, invoice_number),
+                   'APPROVED', 'APPROVED', 'NOT_POSTED', ?, ?)""",
+                (correlation_id, str(attachment), file_hash, invoice_number, now, now),
             )
             Database.add_log(
                 connection,

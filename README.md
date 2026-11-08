@@ -249,6 +249,7 @@ For other isolated databases, commands that support `--db-path` include `email-i
 - Excel output is generated from SQLite with temporary-file replacement.
 - Archive verifies SHA-256 before moving an image and logs failures.
 - Approval and ERP operations retain audit records in `ProcessLogs.xlsx`.
+- New database timestamps are stored as UTC ISO-8601 with an explicit `+00:00` offset. Excel and application logs display Asia/Jakarta time as `YYYY-MM-DD HH:mm WIB`; Excel uses native local datetime cells with a `WIB` number-format suffix so sorting remains chronological. Legacy SQLite `CURRENT_TIMESTAMP` values (`YYYY-MM-DD HH:MM:SS`) are interpreted as UTC because SQLite defines that built-in value in UTC. Naive timestamps imported from an unknown external system require manual review.
 
 ## Automated tests
 

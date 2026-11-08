@@ -4,6 +4,8 @@ import hashlib, os, sqlite3, tempfile
 from contextlib import closing
 from pathlib import Path
 
+from src.time_utils import utc_now_iso
+
 def store_attachment(database: Path, attachment_id: int, data: bytes, suffix: str, root: Path) -> Path:
     """Menulis file atomik, memverifikasi hash, lalu mengubah state database."""
     digest=hashlib.sha256(data).hexdigest()
@@ -26,6 +28,6 @@ def store_attachment(database: Path, attachment_id: int, data: bytes, suffix: st
                 # Temporary file tidak boleh tertinggal jika write/replace gagal.
                 if temp and temp.exists(): temp.unlink()
                 raise
-        con.execute("UPDATE imap_attachments SET storage_path=?,processing_status='FILE_STORED',error_reason=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",(str(target),attachment_id))
+        con.execute("UPDATE imap_attachments SET storage_path=?,processing_status='FILE_STORED',error_reason=NULL,updated_at=? WHERE id=?",(str(target),utc_now_iso(),attachment_id))
         con.commit()
     return target

@@ -86,17 +86,107 @@ class GoogleVisionClient:  # Mengenkapsulasi komunikasi REST ke Google Cloud Vis
 def extract_invoice_fields(text: str) -> ExtractedInvoice:  # Mengubah teks OCR menjadi lima field invoice terstruktur.
     """Extract assessment fields using regex only, never an LLM."""  # Menegaskan kepatuhan terhadap brief.
     normalized = "\n".join(line.strip() for line in text.splitlines() if line.strip())  # Membersihkan spasi dan baris kosong OCR.
-    invoice_number = _first_group(r"(?:invoice\s*(?:no\.?|number|#)?\s*[:#-]?\s*)([A-Z0-9][A-Z0-9/-]+)", normalized)  # Menangkap nomor invoice.
-    po_number = _first_group(r"(?:p\.?o\.?\s*(?:no\.?|number|#)?\s*[:#-]?\s*)([A-Z0-9][A-Z0-9/-]+)", normalized)  # Menangkap nomor PO.
+    lines = normalized.splitlines()  # Mempertahankan batas baris untuk layout tabel hasil OCR.
+    column_values = _extract_label_value_columns(lines)  # Mencoba pola kolom label lalu kolom nilai secara konservatif.
+    if column_values is not None:  # Hanya memakai mapping posisi setelah seluruh struktur dan tipe nilai tervalidasi.
+        return column_values  # Mencegah regex inline mengambil label berikutnya sebagai nilai.
+    if _looks_like_label_value_columns(lines):  # Layout kolom yang tidak lengkap/ambigu tidak boleh ditebak.
+        return ExtractedInvoice(None, None, None, None, None)  # Biarkan workflow menandai field wajib yang hilang.
+    # Separator inline dibatasi spasi/tab agar header "INVOICE" tidak melompati baris lalu menangkap label berikutnya.
+    invoice_number = _identifier_or_none(_first_group(r"(?:invoice[ \t]*(?:no\.?|number|#)?[ \t]*[:#-]?[ \t]*)([A-Z0-9][A-Z0-9/-]+)", normalized))  # Menangkap nomor invoice.
+    po_number = _identifier_or_none(_first_group(r"(?:p\.?o\.?[ \t]*(?:no\.?|number|#)?[ \t]*[:#-]?[ \t]*)([A-Z0-9][A-Z0-9/-]+)", normalized))  # Menangkap nomor PO.
     currency = _find_currency(normalized)  # Menentukan mata uang dari simbol atau kode ISO.
     amount = _find_amount(normalized)  # Menentukan nominal total invoice.
     vendor_name = _find_vendor(normalized)  # Menentukan nama vendor dari label atau baris awal.
     return ExtractedInvoice(invoice_number, vendor_name, po_number, amount, currency)  # Mengembalikan hasil terstruktur.
 
 
+_COLUMN_LABEL_ORDER = ("invoice_number", "vendor_name", "po_number", "amount", "currency")  # Urutan field assessment pada kolom label.
+
+
+def _column_label(line: str) -> str | None:
+    """Mengubah satu baris label OCR ke key internal tanpa menerima baris bernilai."""
+    compact = re.sub(r"[^a-z0-9]", "", line.lower())  # Mengabaikan variasi spasi, titik, dan kapitalisasi OCR.
+    aliases = {
+        "invoicenumber": "invoice_number",
+        "invoiceno": "invoice_number",
+        "vendorname": "vendor_name",
+        "vendor": "vendor_name",
+        "ponumber": "po_number",
+        "pono": "po_number",
+        "totalamount": "amount",
+        "amount": "amount",
+        "currency": "currency",
+    }
+    return aliases.get(compact)  # Nilai None memastikan teks selain label tidak dianggap bagian struktur.
+
+
+def _looks_like_label_value_columns(lines: list[str]) -> bool:
+    """Mendeteksi adanya lima label lengkap sebagai sinyal agar parser inline tidak menebak nilai."""
+    labels = [_column_label(line) for line in lines]  # Membaca hanya baris yang seluruhnya merupakan label.
+    return all(label in labels for label in _COLUMN_LABEL_ORDER)  # Semua label wajib harus tampak sebelum layout khusus dipertimbangkan.
+
+
+def _extract_label_value_columns(lines: list[str]) -> ExtractedInvoice | None:
+    """Memetakan tabel OCR label-column/value-column hanya bila bentuknya tidak ambigu."""
+    labels = [_column_label(line) for line in lines]  # Mengidentifikasi label berdiri sendiri tanpa mencampur nilai.
+    positions = {label: [index for index, value in enumerate(labels) if value == label] for label in _COLUMN_LABEL_ORDER}
+    # Label ganda dapat menunjukkan tabel lain atau hasil OCR yang tidak stabil, sehingga posisi tidak aman dipakai.
+    if any(len(indices) != 1 for indices in positions.values()):
+        return None
+    label_start = positions["invoice_number"][0]  # Kolom valid selalu dimulai dari label Invoice Number.
+    expected_positions = list(range(label_start, label_start + len(_COLUMN_LABEL_ORDER)))
+    actual_positions = [positions[label][0] for label in _COLUMN_LABEL_ORDER]
+    if actual_positions != expected_positions:
+        return None  # Menolak urutan atau label tambahan di tengah kolom agar tidak salah memetakan nilai.
+    value_start = label_start + len(_COLUMN_LABEL_ORDER)  # Nilai harus langsung mengikuti blok lima label.
+    if len(lines) < value_start + len(_COLUMN_LABEL_ORDER):
+        return None  # Nilai yang kurang tidak boleh dilengkapi dari data PO atau tebakan lain.
+    values = lines[value_start : value_start + len(_COLUMN_LABEL_ORDER)]  # Mengambil tepat lima nilai dalam urutan assessment.
+    if any(not value or _column_label(value) is not None for value in values):
+        return None  # Menolak nilai kosong atau label yang terbaca ulang sebagai nilai.
+
+    invoice_number, vendor_name, po_number, raw_amount, raw_currency = values
+    if _identifier_or_none(invoice_number) is None:
+        return None
+    if _identifier_or_none(po_number) is None:
+        return None
+    if not re.search(r"[A-Z0-9]", vendor_name, flags=re.IGNORECASE):
+        return None
+    amount = _parse_column_amount(raw_amount)  # Memvalidasi nominal secara mandiri, bukan dengan master PO.
+    currency = _parse_column_currency(raw_currency)
+    if amount is None or currency is None:
+        return None
+    return ExtractedInvoice(_identifier_or_none(invoice_number), vendor_name.strip()[:120], _identifier_or_none(po_number), amount, currency)
+
+
+def _parse_column_amount(value: str) -> Decimal | None:
+    """Memvalidasi nominal satu sel kolom, termasuk prefix/suffix currency yang lazim."""
+    match = re.fullmatch(r"(?:IDR|USD|EUR|RP\.?|\$|€)?\s*([0-9][0-9.,]*)\s*(?:IDR|USD|EUR|RP\.?|\$|€)?", value.strip(), flags=re.IGNORECASE)
+    return _parse_money(match.group(1)) if match else None
+
+
+def _parse_column_currency(value: str) -> str | None:
+    """Menerima hanya kode/simbol currency tunggal agar baris nominal tidak tertukar dengan currency."""
+    compact = value.strip().upper().replace(".", "")
+    aliases = {"IDR": "IDR", "RP": "IDR", "RUPIAH": "IDR", "USD": "USD", "EUR": "EUR", "$": "USD", "€": "EUR"}
+    return aliases.get(compact)
+
+
 def _first_group(pattern: str, text: str) -> str | None:  # Mengambil capture group pertama dari pola regex.
     match = re.search(pattern, text, flags=re.IGNORECASE)  # Menjalankan pencarian tanpa membedakan kapitalisasi.
     return match.group(1).strip() if match else None  # Mengembalikan nilai bersih atau None bila tidak ditemukan.
+
+
+def _identifier_or_none(value: str | None) -> str | None:
+    """Menolak label generik OCR agar tidak tersimpan sebagai nomor invoice atau PO."""
+    if value is None or not re.fullmatch(r"[A-Z0-9][A-Z0-9/-]+", value, flags=re.IGNORECASE):
+        return None
+    # Nilai ini adalah label, bukan identifier bisnis; penolakan eksplisit mencegah false-positive lintas baris.
+    generic_labels = {"INVOICE", "NUMBER", "INVOICENUMBER", "PO", "PONO", "PONUMBER"}
+    if re.sub(r"[^A-Z0-9]", "", value.upper()) in generic_labels:
+        return None
+    return value.strip()
 
 
 def _find_currency(text: str) -> str | None:  # Mendeteksi mata uang yang umum pada invoice assessment.
