@@ -91,6 +91,18 @@ class ApprovalReply:
     decision: str | None
 
 
+@dataclass(frozen=True)
+class ApprovalReplyDiagnostic:
+    """Diagnostic non-sensitif untuk satu reply; tidak menyimpan body, sender, atau token."""
+    uid: str
+    content_type: str
+    content_transfer_encoding: str
+    decision_detected: bool
+    token_label_detected: bool
+    reply_format_valid: bool
+    failure_category: str | None
+
+
 def parse_reply(raw_message: bytes) -> ApprovalReply:
     """Parse a reply using the documented body format without executing email content."""
     message = message_from_bytes(raw_message)
@@ -107,7 +119,11 @@ def _plain_text_body(message: object) -> str:
     if getattr(message, "is_multipart")():
         for part in message.walk():
             if part.get_content_type() == "text/plain" and not part.get_filename():
-                return part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="replace")
+                payload=part.get_payload(decode=True)
+                if payload is None:
+                    raw=part.get_payload()
+                    return raw if isinstance(raw,str) else ''
+                return payload.decode(part.get_content_charset() or "utf-8", errors="replace")
         return ""
     payload = message.get_payload(decode=True) or b""
     return payload.decode(message.get_content_charset() or "utf-8", errors="replace")
@@ -123,32 +139,102 @@ def _latest_reply_segment(body: str) -> str:
     return "\n".join(kept)
 
 
+def diagnose_reply(raw_message: bytes, uid: str) -> ApprovalReplyDiagnostic:
+    """Mengklasifikasikan format MIME reply tanpa membocorkan isi/sender/token atau mengubah database."""
+    message=message_from_bytes(raw_message)
+    body=_plain_text_body(message); latest=_latest_reply_segment(body); parsed=parse_reply(raw_message)
+    decision=bool(re.search(r"^\s*(APPROVE|REJECT)\s*$",latest,re.IGNORECASE|re.MULTILINE))
+    token_label=bool(re.search(r"^\s*Approval\s+Token\s*:",latest,re.IGNORECASE|re.MULTILINE))
+    valid=parsed.decision is not None and parsed.token is not None
+    category=None
+    if not body: category='NO_TEXT_PLAIN_CONTENT'
+    elif not latest.strip() and body.strip(): category='QUOTED_CONTENT_ONLY'
+    elif not decision and re.search(r"APPROVE|REJECT",body,re.IGNORECASE): category='DECISION_ONLY_IN_QUOTED_CONTENT'
+    elif not decision: category='MISSING_DECISION'
+    elif not token_label: category='MISSING_TOKEN_LABEL'
+    elif not valid: category='INVALID_TOKEN_FORMAT'
+    return ApprovalReplyDiagnostic(
+        uid=uid,content_type=message.get_content_type(),
+        content_transfer_encoding=(message.get('Content-Transfer-Encoding') or 'none').lower(),
+        decision_detected=decision,token_label_detected=token_label,
+        reply_format_valid=valid,failure_category=category,
+    )
+
+
 class ImapInbox:
-    """One-shot IMAP reader; callers schedule it rather than polling indefinitely."""
+    """Pembaca reply IMAP terbatas dan read-only; tidak pernah mengubah flag mailbox."""
 
-    def __init__(self, settings: EmailSettings) -> None:
+    def __init__(self, settings: EmailSettings, timeout_seconds: int = 30) -> None:
         self.settings = settings
+        self.timeout_seconds = timeout_seconds
 
-    def unread_messages(self) -> list[tuple[str, bytes]]:
-        """Fetch unread messages once and mark them seen only after retrieval."""
-        messages: list[tuple[str, bytes]] = []
-        with imaplib.IMAP4_SSL(self.settings.imap_host, self.settings.imap_port, timeout=30) as client:
-            client.login(self.settings.imap_username, self.settings.imap_password)
-            client.select("INBOX")
-            status, data = client.uid("search", None, "UNSEEN")
-            if status != "OK":
-                raise OSError("IMAP search failed")
-            for uid in data[0].split():
-                status, payload = client.uid("fetch", uid, "(RFC822)")
-                if status != "OK" or not payload or not isinstance(payload[0], tuple):
-                    continue
-                messages.append((uid.decode(), payload[0][1]))
-                client.uid("store", uid, "+FLAGS", "\\Seen")
+    @staticmethod
+    def _payload(payload: object) -> bytes | None:
+        """Mengambil bytes dari respons FETCH tanpa mengasumsikan struktur provider tertentu."""
+        if not isinstance(payload, list) or not payload or not isinstance(payload[0], tuple): return None
+        data=payload[0][1]
+        return data if isinstance(data,bytes) else None
+
+    @staticmethod
+    def _quote_search_value(value: str) -> str:
+        """Membuat quoted-string RFC 3501; imaplib tidak melakukan quoting otomatis."""
+        return '"'+value.replace('\\','\\\\').replace('"','\\"')+'"'
+
+    def _search_criteria(self, approver_email: str | None) -> tuple[str,...]:
+        """Membangun atom SEARCH yang valid tanpa mengandalkan filter ini untuk autentikasi."""
+        if not approver_email: return ('UNSEEN',)
+        return ('UNSEEN','FROM',self._quote_search_value(approver_email),'TEXT',self._quote_search_value('Approval Token:'))
+
+    def _fetch_reply_raw(self, client: object, uid: bytes) -> bytes | None:
+        """Merekonstruksi MIME dari header penting dan BODY.PEEK[TEXT], tanpa RFC822/attachment."""
+        header_spec='(BODY.PEEK[HEADER.FIELDS (FROM CONTENT-TYPE CONTENT-TRANSFER-ENCODING MIME-VERSION)])'
+        status,header_payload=client.uid('fetch',uid,header_spec)
+        if status!='OK': return None
+        status,text_payload=client.uid('fetch',uid,'(BODY.PEEK[TEXT])')
+        header=self._payload(header_payload); text=self._payload(text_payload)
+        if status!='OK' or header is None or text is None: return None
+        return header+b'\r\n'+text
+
+    def unread_messages(self, approver_email: str | None = None, max_messages: int = 10, processed_uids: set[str] | None = None) -> list[tuple[str, bytes]]:
+        """Ambil maksimal reply kandidat terbaru tanpa RFC822/attachment/full mailbox fetch."""
+        if not 1 <= max_messages <= 100: raise ValueError('max_messages must be between 1 and 100')
+        processed_uids=processed_uids or set(); messages: list[tuple[str,bytes]]=[]
+        with imaplib.IMAP4_SSL(self.settings.imap_host,self.settings.imap_port,timeout=self.timeout_seconds) as client:
+            client.login(self.settings.imap_username,self.settings.imap_password)
+            # Read-only dan BODY.PEEK memastikan message tidak menjadi Seen.
+            status,_=client.select('INBOX',readonly=True)
+            if status!='OK': raise OSError('IMAP INBOX read-only access failed')
+            # Filter server hanya optimasi; sender dan token selalu divalidasi ulang di database.
+            status,data=client.uid('search',None,*self._search_criteria(approver_email))
+            if status!='OK': raise OSError(f'IMAP search failed with server status {status}')
+            uids=(data[0] if data else b'').split()
+            # Ambil UID terbaru yang belum punya receipt; batch berikutnya kemudian dapat melanjutkan yang lebih lama.
+            selected=[]
+            for uid in reversed(uids):
+                uid_text=uid.decode()
+                if uid_text in processed_uids: continue
+                selected.append(uid)
+                if len(selected)==max_messages: break
+            for uid in selected:
+                # Header MIME penting diperlukan agar multipart/encoding dapat diurai tanpa RFC822 penuh.
+                raw=self._fetch_reply_raw(client,uid)
+                if raw is not None: messages.append((uid.decode(),raw))
         return messages
+
+    def diagnose_uid(self, uid: str) -> ApprovalReplyDiagnostic:
+        """Diagnostic satu UID melalui IMAP read-only; tidak memproses reply maupun menyentuh database."""
+        if not re.fullmatch(r'\d+',uid): raise ValueError('UID diagnostic must be numeric')
+        with imaplib.IMAP4_SSL(self.settings.imap_host,self.settings.imap_port,timeout=self.timeout_seconds) as client:
+            client.login(self.settings.imap_username,self.settings.imap_password)
+            status,_=client.select('INBOX',readonly=True)
+            if status!='OK': raise OSError('IMAP INBOX read-only access failed')
+            raw=self._fetch_reply_raw(client,uid.encode())
+            if raw is None: raise OSError('IMAP diagnostic fetch failed')
+            return diagnose_reply(raw,uid)
 
     def check_connectivity(self) -> None:
         """Verifikasi TLS, login, dan akses INBOX tanpa membaca atau menandai email."""
-        with imaplib.IMAP4_SSL(self.settings.imap_host, self.settings.imap_port, timeout=30) as client:
+        with imaplib.IMAP4_SSL(self.settings.imap_host, self.settings.imap_port, timeout=self.timeout_seconds) as client:
             client.login(self.settings.imap_username, self.settings.imap_password)
             status, _ = client.select("INBOX", readonly=True)
             if status != "OK":

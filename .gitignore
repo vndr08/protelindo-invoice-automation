@@ -1,8 +1,20 @@
 .venv/
 __pycache__/
 *.py[cod]
+.DS_Store
 .env
+# Salinan konfigurasi demo lokal; tidak pernah menjadi artefak submission.
+local-config/
+# Nama credential Google yang lazim; source, fixture, dan template tetap tidak terpengaruh.
+**/credentials.json
+**/service-account.json
 data/*.db
+data/live-test/
+data/erp-auto-test/
+data/final-e2e-test/
+data/runtime/
+data/test-runs/
+data/attachments/
 data/incoming/*
 !data/incoming/.gitkeep
 data/processed/*

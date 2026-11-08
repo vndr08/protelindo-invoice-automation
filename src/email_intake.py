@@ -158,35 +158,61 @@ def _process_imap_message(message: ImapMessage, mailbox_identity: str, db_path: 
     stored=store_registered_attachments(registered,db_path,storage_directory)
     return finalize_stored_attachments(stored,db_path)
 
-def run_email_intake(adapter: ReadOnlyImapAdapter, mailbox_identity: str, db_path: Path, storage_directory: Path, max_bytes: int) -> dict[str,int]:
+def run_email_intake(adapter: ReadOnlyImapAdapter, mailbox_identity: str, db_path: Path, storage_directory: Path, max_bytes: int, selected_uid: str | None = None, selected_uidvalidity: str | None = None) -> dict[str,int]:
     """Memproses satu batch IMAP read-only sampai invoice RECEIVED tanpa polling tak terbatas."""
     if max_bytes <= 0: raise ValueError('max_bytes must be positive')
+    if bool(selected_uid) != bool(selected_uidvalidity):
+        raise ValueError('selected_uid and selected_uidvalidity must be supplied together')
     database=Database(db_path); database.initialise()
-    summary={'messages':0,'message_errors':0,'attachments':0,'completed':0,'imap_errors':0,'recovered':0}
+    summary={'messages':0,'message_errors':0,'attachments':0,'completed':0,'imap_errors':0,'recovered':0,'uidvalidity_mismatch':0}
 
-    # Selesaikan state durable lokal lebih dahulu; fungsi recovery tidak membutuhkan payload baru.
-    before=recover(database); summary['recovered']+=before['completed']
-    refetch_rows=[item for item in database.pending_imap_attachments()
-                  if item['processing_status']=='NEEDS_REFETCH' and item['mailbox_identity']==mailbox_identity]
-    expected_validity={item['uid']:item['uidvalidity'] for item in refetch_rows}
-    try:
-        # NEEDS_REFETCH memakai UID asal, bukan mencari email baru atau mengubah flag mailbox.
-        refetched=adapter.fetch_uids(sorted(expected_validity)) if expected_validity else []
-        unseen=adapter.fetch_unseen()
-    except Exception as error:
-        # Credential/timeout/mailbox error tidak mengubah state attachment dan dapat dicoba pada batch berikutnya.
-        summary['imap_errors']+=1
-        LOGGER.warning('imap_intake_connection_failed',extra={'error_class':classify_recovery_error(error)})
-        return summary
+    if selected_uid:
+        # Mode test hanya FETCH UID eksplisit; tidak SEARCH/menyentuh email UNSEEN lain.
+        try:
+            selected=adapter.fetch_uids([selected_uid])
+        except Exception as error:
+            summary['imap_errors']+=1
+            LOGGER.warning('imap_intake_connection_failed',extra={'error_class':classify_recovery_error(error)})
+            return summary
+        candidates=[]
+        for message in selected:
+            if message.uidvalidity==selected_uidvalidity:
+                candidates.append(message)
+            else:
+                summary['uidvalidity_mismatch']+=1
+                LOGGER.warning('imap_selected_uidvalidity_changed',extra={'uid':selected_uid})
+    else:
+        candidates=None
+
+    if candidates is None:
+        # Selesaikan state durable lokal lebih dahulu; fungsi recovery tidak membutuhkan payload baru.
+        before=recover(database); summary['recovered']+=before['completed']
+        refetch_rows=[item for item in database.pending_imap_attachments()
+                      if item['processing_status']=='NEEDS_REFETCH' and item['mailbox_identity']==mailbox_identity]
+        expected_refetch={(item['uidvalidity'],item['uid']) for item in refetch_rows}
+        try:
+            # NEEDS_REFETCH memakai UID asal, bukan mencari email baru atau mengubah flag mailbox.
+            refetched=adapter.fetch_uids(sorted({uid for _,uid in expected_refetch})) if expected_refetch else []
+            unseen=adapter.fetch_unseen()
+        except Exception as error:
+            # Credential/timeout/mailbox error tidak mengubah state attachment dan dapat dicoba pada batch berikutnya.
+            summary['imap_errors']+=1
+            LOGGER.warning('imap_intake_connection_failed',extra={'error_class':classify_recovery_error(error)})
+            return summary
+
+        # UID dari UIDVALIDITY lama tidak boleh dikaitkan dengan message baru setelah mailbox reset.
+        valid_refetched=[]
+        for message in refetched:
+            if (message.uidvalidity,message.uid) in expected_refetch:
+                valid_refetched.append(message)
+            else:
+                LOGGER.warning('imap_refetch_uidvalidity_changed',extra={'uid':message.uid})
+        candidates=valid_refetched+unseen
 
     processed=set()
-    for message in refetched+unseen:
+    for message in candidates:
         identity=(message.uidvalidity,message.uid)
         if identity in processed: continue
-        # UID dari UIDVALIDITY lama tidak boleh dikaitkan dengan message baru setelah mailbox reset.
-        if message.uid in expected_validity and message.uidvalidity != expected_validity[message.uid]:
-            LOGGER.warning('imap_refetch_uidvalidity_changed',extra={'uid':message.uid})
-            continue
         processed.add(identity)
         try:
             final= _process_imap_message(message,mailbox_identity,db_path,storage_directory,max_bytes)
@@ -200,5 +226,6 @@ def run_email_intake(adapter: ReadOnlyImapAdapter, mailbox_identity: str, db_pat
                 'uid':message.uid,
                 'error_class':classify_recovery_error(error),
             })
-    after=recover(database); summary['recovered']+=after['completed']
+    if not selected_uid:
+        after=recover(database); summary['recovered']+=after['completed']
     return summary

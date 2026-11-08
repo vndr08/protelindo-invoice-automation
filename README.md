@@ -1,143 +1,281 @@
 # Protelindo Invoice Automation
 
-Python automation for the Junior Automation Developer technical assessment.
+Python automation for the Protelindo Junior Automation Developer technical assessment.
 
-## Current setup
+The system processes an invoice from an IMAP mailbox through Google Cloud Vision OCR, regex extraction, SQLite, PO validation, email approval, browser-based ERP simulation, Excel export, and archival. A reviewer can use their own mailbox, API key, web form, and invoice files.
 
-This initial foundation provides:
+## Requirement coverage
 
-- Excel-driven application configuration;
-- SQLite database schema for invoices and process logs;
-- local runtime folders and application logging;
-- a CLI for initialisation and status checks.
-- local image/PDF intake with SHA-256 duplicate detection.
-- Google Cloud Vision OCR via API key in `.env` and regex-only invoice extraction.
+| Assessment requirement | Implementation |
+| --- | --- |
+| Email intake and save invoice image | Read-only IMAP intake with a local-folder alternative, attachment validation, and SHA-256 deduplication. |
+| Google Vision + regex extraction | Google Vision `TEXT_DETECTION`; regex extracts InvoiceNumber, VendorName, PO_Number, Amount, and Currency. No LLM is used. |
+| Database as source of truth | SQLite stores invoices, OCR output, validation, approval, posting, archive state, and process logs. |
+| PO validation | Dynamic `PurchaseOrders.csv` lookup with normalized PO/vendor/amount/currency comparison. |
+| Threshold approval | `ThresholdAmount` and `ApproverEmail` are read from `Config.xlsx`; above-threshold invoices require a valid email reply. |
+| Browser ERP form | Playwright populates a responder form and uses a persistent PostingRef. |
+| Excel and archive | Generates `Invoices.xlsx`, `ERP_Dummy.xlsx`, and `ProcessLogs.xlsx` from SQLite, then archives final invoice images. |
 
-## Quick start
+## Architecture
 
-Requires Python 3.11 or newer.
+```text
+IMAP/local image
+  -> Google Vision OCR
+  -> regex extraction
+  -> SQLite
+  -> PO validation
+  -> auto approval OR email approval
+  -> Playwright ERP form
+  -> archive
+  -> Excel exports
+```
+
+The workflow is state-based and idempotent. Re-running a normal batch does not create a duplicate invoice, approval request, attachment, or ERP submission. A Google Forms submission without strong confirmation is recorded as `POSTING_UNCERTAIN` and is never auto-retried.
+
+## Prerequisites
+
+- Python 3.11 or newer
+- A mailbox you control with IMAP and SMTP enabled (Gmail App Password is supported)
+- A Google Cloud Vision API key
+- A Google Forms responder URL
+- Chromium for Playwright
+
+Only JPG, JPEG, and PNG are supported end-to-end for email attachment OCR. PDF OCR is intentionally not supported by the current Google Vision image flow.
+
+## Installation
+
+### Windows PowerShell
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+Copy-Item .env.example .env
+```
+
+### macOS / Linux
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
-pip install -r requirements.txt
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m playwright install chromium
 cp .env.example .env
+```
+
+## Configuration
+
+### `.env`
+
+Copy `.env.example` to `.env` and provide your own values. The file is ignored by Git and must never be committed.
+
+Required for the complete workflow:
+
+- `GOOGLE_VISION_API_KEY`
+- `IMAP_HOST`, `IMAP_PORT`, `IMAP_USERNAME`, `IMAP_PASSWORD`
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`
+- `ERP_CONFIRMATION_TEXT` — exact success message shown by the responder form
+- `ERP_SUBMIT_BUTTON_TEXT` — preferred button label; `Submit` and `Kirim` are controlled fallbacks
+
+Optional operational settings include `HEADLESS`, IMAP timeout/batch limits, approval token TTL, attachment size limit, and ERP browser timeout. See `.env.example` for every supported setting.
+
+For Gmail, enable two-step verification and generate a Mail App Password. Use the App Password in the local IMAP and SMTP password variables; do not use or commit the normal account password.
+
+### `resources/Config.xlsx`
+
+The public workbook preserves the official `Config_T` sheet and keys:
+
+| Key | Reviewer action |
+| --- | --- |
+| `ThresholdAmount` | Set the approval threshold required for the test. |
+| `FormsUrl` | Replace the placeholder with the responder URL, ending in `/viewform`; never use an editor URL. |
+| `ExcelERPPath` | Retained from the assessment template. |
+| `ApproverEmail` | Replace the placeholder with the mailbox allowed to approve/reject. |
+
+The public repository deliberately contains placeholders for `FormsUrl` and `ApproverEmail`. `python main.py preflight-check` reports either placeholder as a blocker rather than using an unsafe fallback.
+
+## Google Forms setup
+
+The assessment permits either Microsoft Forms or Google Forms. This implementation deliberately supports **Google Forms only** through Playwright; use a Google Forms responder URL for `FormsUrl`.
+
+Create a responder form with these seven short-answer fields. Labels must match exactly.
+
+1. `PostingRef`
+2. `CorrelationId`
+3. `InvoiceNumber`
+4. `VendorName`
+5. `PO_Number`
+6. `Amount`
+7. `Currency`
+
+Before a live post, use the read-only locator check:
+
+```bash
+python main.py erp-form-check
+python main.py erp-form-diagnose
+```
+
+Both commands open the form but do not populate fields or click Submit/Kirim.
+
+## Quick start: step-by-step workflow
+
+First configure `.env` and `resources/Config.xlsx`, then initialise local folders and SQLite:
+
+```bash
+python main.py preflight-check
 python main.py init
-python main.py status
-python main.py intake
-python main.py ocr
 ```
 
-`resources/Config.xlsx` and the Excel templates are supplied with the assessment and must be present before `init`. Do not commit `.env`, credentials, or generated database/output files.
-
-Place `.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff`, or `.pdf` invoice files in `data/incoming/`, then run `python main.py intake`. Each unique file is registered in SQLite with a correlation ID. Re-running intake (or adding a copy of the same file under another name) is safely logged as a duplicate.
-
-## IMAP invoice intake
-
-Invoice email intake is a finite, read-only IMAP batch. It uses UID plus UIDVALIDITY, `BODY.PEEK[]`, and never marks, moves, or deletes a message. Configure the mailbox in `.env` (an app password is recommended for Gmail):
-
-```env
-IMAP_HOST=imap.example.com
-IMAP_PORT=993
-IMAP_USERNAME=automation@example.com
-IMAP_PASSWORD=app-password
-IMAP_INTAKE_MAILBOX=INBOX
-IMAP_INTAKE_TIMEOUT_SECONDS=30
-IMAP_ATTACHMENT_MAX_BYTES=10485760
-```
-
-Run one batch manually or from a scheduler:
-
-```bash
-python main.py email-intake
-```
-
-Only JPEG/JPG and PNG attachments that pass filename, MIME type, signature, and size validation are admitted. The pipeline stores each attachment atomically, registers one content-unique invoice in `RECEIVED` state, then finalizes the attachment audit record. Re-running a UID or duplicate content is safe. A missing local durable file becomes `NEEDS_REFETCH` and is retried only when its original UID payload is available again; no unbounded polling or automatic retry loop is used.
-
-Add `GOOGLE_VISION_API_KEY` to your local `.env`, then run `python main.py ocr`. This processes invoices in `RECEIVED` status using Google Vision `TEXT_DETECTION`, then stores raw OCR text and regex-extracted invoice fields in SQLite. To retry known OCR failures after a network/configuration fix, run `python main.py ocr --retry-failed`. The current OCR command supports image files; PDF support will be added separately because it uses a different Google Vision flow.
-
-If only a regex pattern changes, run `python main.py reextract`. It reuses stored OCR text and therefore makes no Google Vision API calls.
-
-## Purchase Order validation
-
-Validate all OCR-complete invoices against the supplied CSV:
-
-```bash
-python main.py po-validate
-```
-
-By default the command reads `resources/PurchaseOrders.csv`. A reviewer can point it to their own source without code changes:
-
-```bash
-python main.py po-validate --po-file /path/to/PurchaseOrders.csv
-```
-
-The validator normalizes PO number, vendor name, amount, and currency before comparison. It saves `MATCHED`, `PO_NOT_FOUND`, `VENDOR_MISMATCH`, `AMOUNT_MISMATCH`, `CURRENCY_MISMATCH`, or `MISSING_REQUIRED_FIELDS` plus an audit reason in SQLite. Each invoice is processed only from `EXTRACTED` status, so a normal re-run is idempotent and produces no duplicate validation transaction or process-log row.
-
-## Email approval workflow
-
-Configure the same test mailbox for SMTP and IMAP in `.env`; use an app password when your provider requires one. `ThresholdAmount` and `ApproverEmail` are always read from `resources/Config.xlsx`.
-
-```env
-SMTP_HOST=smtp.example.com
-SMTP_PORT=587
-SMTP_USERNAME=automation@example.com
-SMTP_PASSWORD=app-password
-IMAP_HOST=imap.example.com
-IMAP_PORT=993
-IMAP_USERNAME=automation@example.com
-IMAP_PASSWORD=app-password
-APPROVAL_TOKEN_TTL_HOURS=24
-```
-
-For Gmail, enable two-step verification on the test mailbox, create a **Google App Password** for Mail, and use that 16-character app password as both `SMTP_PASSWORD` and `IMAP_PASSWORD`. Do not use the normal Gmail password. Use `smtp.gmail.com:587` and `imap.gmail.com:993`, then verify credentials without sending any email:
+`email-check` verifies SMTP and IMAP authentication without sending, fetching, or changing messages:
 
 ```bash
 python main.py email-check
 ```
 
-This command only performs SMTP `STARTTLS` + login + `NOOP`, plus IMAP TLS login and read-only `INBOX` access. It does not send, fetch, mark, or alter any email.
+### 1. Select and intake one Gmail invoice
 
-Run one approval batch after PO validation:
+List a bounded set of unread UID metadata first. This does not fetch message bodies or attachments:
+
+```bash
+python main.py email-intake --list-uids --limit 10
+```
+
+Then process one deliberately selected UID/UIDVALIDITY pair:
+
+```bash
+python main.py email-intake --uid <UID> --uidvalidity <UIDVALIDITY>
+```
+
+The IMAP connection is read-only and uses `BODY.PEEK[]`; it does not mark, move, or delete email. For local files instead, place an invoice image in `data/incoming/` and run:
+
+```bash
+python main.py intake
+```
+
+### 2. OCR, extraction, and PO validation
+
+```bash
+python main.py ocr
+python main.py po-validate
+```
+
+OCR errors are recorded as `OCR_FAILED`. Missing or invalid extracted fields become an auditable PO validation failure rather than an approval/ERP candidate. To re-run regex only, without a Vision request:
+
+```bash
+python main.py reextract
+```
+
+### 3. Approval
 
 ```bash
 python main.py approval-initiate
 ```
 
-Amounts at or below the configured threshold become `AUTO_APPROVED`. Larger amounts become `PENDING_APPROVAL`; the request is first saved to the SQLite outbox and then sent through SMTP. The approver must reply in this exact body format:
+Invoices at or below `ThresholdAmount` become `AUTO_APPROVED`. Higher values become `PENDING_APPROVAL` and receive one durable SMTP approval request.
+
+The approver replies using this body format:
 
 ```text
 APPROVE
-Approval Token: <token-from-request>
+Approval Token: <token from approval request>
 ```
 
-Use `REJECT` instead of `APPROVE` to reject. Read one finite IMAP batch manually or from a scheduler:
+Use `REJECT` instead of `APPROVE` to reject. After the reply arrives, process one bounded read-only batch:
 
 ```bash
-python main.py approval-read-replies
+python main.py approval-read-replies --max-messages 10
 ```
 
-If SMTP fails, the outbox is marked `FAILED` and can be retried explicitly (maximum three attempts):
+Sender, token, expiry, and duplicate receipt are validated before a decision is applied. A rejected invoice is never eligible for ERP posting.
+
+### 4. ERP posting, archive, and export
+
+Only `APPROVED` or `AUTO_APPROVED` invoices are eligible:
 
 ```bash
-python main.py approval-retry-delivery
+python main.py erp-post
+python main.py archive-invoices
+python main.py export-excel
 ```
 
-Messages left in `SENDING` are deliberately never resent automatically: SMTP cannot guarantee exactly-once delivery if a network failure occurs after the server accepts a message but before SQLite records `SENT`. Reconcile such messages manually before retrying to avoid duplicate email. Passwords and approval tokens are never logged; the outbox body temporarily holds the token until delivery, so protect the local SQLite file with normal device/storage controls.
+The browser is visible by default (`HEADLESS=false`). If confirmation is not observed after the form button is clicked, the invoice remains `POSTING_UNCERTAIN`; do not run `erp-post` again. Verify exactly one matching Form response manually and use the guarded reconciliation command instead:
 
-## Google Forms ERP simulation
+```bash
+python main.py erp-reconcile --db-path <database-path> --invoice-number <invoice-number> --posting-ref <posting-ref> --confirmed-in-responses --dry-run
+```
 
-Create a Google Form with required short-answer fields: `PostingRef`, `CorrelationId`, `InvoiceNumber`, `VendorName`, `PO_Number`, `Amount`, and `Currency`. Put its responder URL into `FormsUrl` in `resources/Config.xlsx`, install `playwright`, then run `playwright install chromium` once and execute `python main.py erp-post`. A POSTED state requires Google Forms confirmation text; timeout after Submit becomes `POSTING_UNCERTAIN` and is never retried automatically. `POSTING_UNCERTAIN` must be reconciled against Form responses using the Posting Reference before any manual retry.
+Remove `--dry-run` only after confirming the matching response.
 
-Before any real submission, validate connectivity and labels only with `python main.py erp-form-check`. This command never fills a field or clicks Submit.
+## Isolated end-to-end run
 
-## Export and archive
+The project includes an isolated test environment under `data/final-e2e-test/`, which is ignored by Git.
 
-Run `python main.py export-excel` to atomically rebuild `output/Invoices.xlsx`, `output/ERP_Dummy.xlsx`, and `output/ProcessLogs.xlsx` from SQLite. Run `python main.py archive-invoices` to move only final states: POSTED→success, REJECTED→rejected, PO_VALIDATION_FAILED→validation_failed, OCR_FAILED→review. Pending approval/posting records remain untouched. If an archive hash mismatches or file is missing, it remains unarchived and receives an audit log.
+```bash
+python main.py final-e2e-prepare
+python main.py run-once --dry-run
+python main.py run-once --uid <UID> --uidvalidity <UIDVALIDITY>
+```
 
-## Next milestones
+A fresh run processes the explicit UID only. It can pause at `PENDING_APPROVAL`. After the approver reply has been processed with `approval-read-replies`, continue the same isolated environment:
 
-1. Local invoice intake and duplicate detection.
-2. Google Vision OCR and regex extraction.
-3. PO validation and approval workflow.
-4. Browser ERP submission and Excel export.
+```bash
+python main.py run-once --resume
+```
+
+`--resume` does not read approval replies itself; that explicit operator step is intentional.
+
+For other isolated databases, commands that support `--db-path` include `email-intake`, `ocr`, `po-validate`, `approval-initiate`, `approval-read-replies`, `erp-post`, `export-excel`, and `archive-invoices`.
+
+## Outputs and folders
+
+| Location | Purpose |
+| --- | --- |
+| `data/automation.db` | Default SQLite source of truth; ignored by Git. |
+| `data/incoming/` | Local intake files / durable email attachments. |
+| `data/processed/` | Archive destination: `success`, `rejected`, `validation_failed`, or `review`. |
+| `output/Invoices.xlsx` | All invoice records, exported from SQLite. |
+| `output/ERP_Dummy.xlsx` | Only invoices with `posting_state = POSTED`. |
+| `output/ProcessLogs.xlsx` | Process steps and errors, exported from SQLite. |
+| `logs/automation.log` | Local operational log; ignored by Git. |
+
+`PostingRef` is persisted before browser submission and is carried into SQLite, the Form, `Invoices.xlsx`, and `ERP_Dummy.xlsx`.
+
+## Reliability, logging, and recovery
+
+- Unique hashes, IMAP UID/UIDVALIDITY metadata, database constraints, and persistent state prevent duplicate processing.
+- Each invoice/attachment is processed independently so a failure does not stop the batch.
+- Email delivery uses a persistent outbox. SMTP cannot guarantee exactly-once delivery after an ambiguous network failure, so `SENDING` messages are not resent automatically.
+- Excel output is generated from SQLite with temporary-file replacement.
+- Archive verifies SHA-256 before moving an image and logs failures.
+- Approval and ERP operations retain audit records in `ProcessLogs.xlsx`.
+
+## Automated tests
+
+Run the strict local suite:
+
+```bash
+python -W error::ResourceWarning -m unittest discover -s tests -v
+```
+
+Tests use mocks and temporary SQLite/filesystem resources; they do not send email, access Gmail, call Google Vision, or submit a form.
+
+## Verification evidence
+
+Two isolated end-to-end scenarios were completed during development:
+
+| Scenario | Verified outcome |
+| --- | --- |
+| `INV-E2E-001` | PO matched, auto-approved, ERP posted, archived, and exported. |
+| `INV-E2E-003` | PO matched, approval reply validated, ERP posted, archived, and exported. |
+
+These test artifacts are intentionally Git-ignored. Reviewers should execute the documented flow with their own mailbox, form, and API key.
+
+## Submission notes
+
+Before submission:
+
+1. Keep `.env`, databases, generated Excel files, logs, attachment data, local config backups, credentials, and personal mailbox details out of Git.
+2. Share a responder-form URL and access to its responses with the reviewer through an appropriate channel.
+3. Provide the repository link and a short recording of one full run, as required by the assessment brief.
+4. On Windows, run the installation commands above and configure credentials locally before testing with new invoices.

@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import secrets
 import sqlite3
-from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -479,16 +478,126 @@ class Database:
         now = datetime.now(timezone.utc).isoformat()
         with closing(sqlite3.connect(self.path)) as connection:
             connection.row_factory = sqlite3.Row
-            row = connection.execute("SELECT * FROM invoices WHERE correlation_id = ? AND posting_state = 'NOT_POSTED' AND status = 'APPROVED'", (correlation_id,)).fetchone()
+            # Guard kedua di transaksi mencegah invoice APPROVED yang tidak memiliki
+            # keputusan approval sah melewati tahap approval saat terjadi race condition.
+            row = connection.execute("SELECT * FROM invoices WHERE correlation_id = ? AND posting_state = 'NOT_POSTED' AND status = 'APPROVED' AND approval_status IN ('APPROVED', 'AUTO_APPROVED')", (correlation_id,)).fetchone()
             if not row:
                 return None
-            posting_ref = f"POST-{secrets.token_hex(8).upper()}"
+            # Recovery posting memakai referensi lama agar rekonsiliasi Form tetap konsisten.
+            posting_ref = row["posting_ref"] or f"POST-{secrets.token_hex(8).upper()}"
             changed = connection.execute("UPDATE invoices SET posting_ref = ?, posting_state = 'POSTING_PENDING', updated_at = ? WHERE correlation_id = ? AND posting_state = 'NOT_POSTED'", (posting_ref, now, correlation_id))
             if not changed.rowcount:
                 return None
             data = dict(row); data["posting_ref"] = posting_ref
             self.add_log(connection, correlation_id, "ERP_POSTING", "POSTING_PENDING", "Posting reference reserved")
             return data
+
+    def prepare_failed_posting_retry(self, invoice_number: str, dry_run: bool = False) -> dict[str, Any]:
+        """Membuka ulang hanya kegagalan pre-submit yang sudah direkonsiliasi operator."""
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """SELECT id, correlation_id, invoice_number, status, approval_status,
+                          posting_state, posting_ref, posted_at
+                   FROM invoices WHERE invoice_number = ?""",
+                (invoice_number,),
+            ).fetchall()
+            if len(rows) != 1:
+                raise ValueError("Invoice number must identify exactly one invoice")
+            invoice = rows[0]
+            # Semua guard diperiksa lagi di WHERE UPDATE untuk aman terhadap proses paralel.
+            valid = (
+                invoice["status"] == "APPROVED"
+                and invoice["approval_status"] in {"APPROVED", "AUTO_APPROVED"}
+                and invoice["posting_state"] == "POSTING_FAILED"
+                and invoice["posting_ref"] is not None
+                and invoice["posted_at"] is None
+            )
+            if not valid:
+                raise ValueError("Invoice is not eligible for failed-posting recovery")
+            result = {
+                "invoice_number": invoice["invoice_number"],
+                "correlation_id": invoice["correlation_id"],
+                "posting_ref": invoice["posting_ref"],
+                "state": "NOT_POSTED",
+                "dry_run": dry_run,
+            }
+            if dry_run:
+                return result
+            now = datetime.now(timezone.utc).isoformat()
+            changed = connection.execute(
+                """UPDATE invoices SET posting_state = 'NOT_POSTED', posting_error = NULL, updated_at = ?
+                   WHERE id = ? AND status = 'APPROVED'
+                     AND approval_status IN ('APPROVED', 'AUTO_APPROVED')
+                     AND posting_state = 'POSTING_FAILED'
+                     AND posting_ref = ? AND posted_at IS NULL""",
+                (now, invoice["id"], invoice["posting_ref"]),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("Posting recovery guard changed concurrently; retry preparation was not applied")
+            # Audit secara eksplisit merekam basis keputusan operator, bukan menghapus jejak failure.
+            self.add_log(
+                connection,
+                invoice["correlation_id"],
+                "ERP_POSTING_RECOVERY",
+                "NOT_POSTED",
+                "Google Forms Responses verified no submission before controlled retry",
+            )
+            return result
+
+    def reconcile_uncertain_posting(self, invoice_number: str, posting_ref: str, dry_run: bool = False) -> dict[str, Any]:
+        """Mencatat POSTED hanya setelah operator memverifikasi satu respons Form yang cocok."""
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """SELECT id, correlation_id, invoice_number, status, approval_status,
+                          posting_state, posting_ref, posted_at
+                   FROM invoices WHERE invoice_number = ?""",
+                (invoice_number,),
+            ).fetchall()
+            if len(rows) != 1:
+                raise ValueError("Invoice number must identify exactly one invoice")
+            invoice = rows[0]
+            # Tidak ada browser/API Form di jalur ini: kecocokan respons merupakan
+            # attestasi operator yang diwajibkan oleh command-line flag.
+            valid = (
+                invoice["status"] == "APPROVED"
+                and invoice["approval_status"] in {"APPROVED", "AUTO_APPROVED"}
+                and invoice["posting_state"] == "POSTING_UNCERTAIN"
+                and invoice["posting_ref"] == posting_ref
+                and invoice["posted_at"] is None
+            )
+            if not valid:
+                raise ValueError("Invoice is not eligible for POSTING_UNCERTAIN reconciliation")
+            result = {
+                "invoice_number": invoice["invoice_number"],
+                "correlation_id": invoice["correlation_id"],
+                "posting_ref": invoice["posting_ref"],
+                "state": "POSTED",
+                "dry_run": dry_run,
+            }
+            if dry_run:
+                return result
+            now = datetime.now(timezone.utc).isoformat()
+            changed = connection.execute(
+                """UPDATE invoices
+                   SET posting_state = 'POSTED', posting_error = NULL, posted_at = ?, updated_at = ?
+                   WHERE id = ? AND status = 'APPROVED'
+                     AND approval_status IN ('APPROVED', 'AUTO_APPROVED')
+                     AND posting_state = 'POSTING_UNCERTAIN'
+                     AND posting_ref = ? AND posted_at IS NULL""",
+                (now, now, invoice["id"], posting_ref),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("Posting reconciliation guard changed concurrently; no update was applied")
+            self.add_log(
+                connection,
+                invoice["correlation_id"],
+                "ERP_POSTING_RECONCILIATION",
+                "POSTED",
+                "Manual confirmation: exactly one Google Forms response matched the invoice and PostingRef",
+            )
+            return result
 
     def set_posting_state(self, correlation_id: str, state: str, error: str | None = None) -> None:
         """Menyimpan state posting dan audit tanpa mengubah decision approval."""
@@ -622,6 +731,11 @@ class Database:
             connection.execute("UPDATE invoices SET approval_status = ?, status = ?, updated_at = ? WHERE correlation_id = ?", (approval_status, approval_status, now_text, request[1]))
             self.add_log(connection, request[1], "EMAIL_APPROVAL_REPLY", approval_status, f"Decision received from configured approver: {approval_status}")
             return self._save_receipt(connection, mailbox_uid, sender_email, approval_status, "Valid approval decision applied", now_text)
+
+    def approval_receipt_uids(self) -> set[str]:
+        """Mengambil UID reply yang sudah diaudit agar batch read-only tidak fetch ulang selamanya."""
+        with closing(sqlite3.connect(self.path)) as connection:
+            return {str(row[0]) for row in connection.execute('SELECT mailbox_uid FROM approval_receipts')}
 
     @staticmethod
     def _save_receipt(connection: sqlite3.Connection, mailbox_uid: str, sender_email: str, result: str, detail: str, received_at: str) -> str:

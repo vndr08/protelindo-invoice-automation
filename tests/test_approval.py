@@ -155,7 +155,7 @@ class ImapInboxTests(unittest.TestCase):
             def __enter__(self): return self
             def __exit__(self, *args: object): return None
             def login(self, *args: object): return "OK", []
-            def select(self, *args: object): return "OK", []
+            def select(self, *args: object, **kwargs: object): return "OK", []
             def uid(self, command: str, *args: object):
                 if command == "search": return "OK", [b"42"]
                 if command == "fetch": return "OK", [(b"header", b"From: approver@example.com\n\nAPPROVE\nApproval Token: abcdefghijklmnopqrstuvwxyz\n")]

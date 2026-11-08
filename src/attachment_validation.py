@@ -14,8 +14,16 @@ def validate_and_store(filename:str|None,mime:str|None,data:bytes,directory:Path
     if not data or len(data)>max_bytes or not data.startswith(SIGNATURES[suffix]): raise AttachmentError('empty, oversized, or corrupt attachment')
     digest=hashlib.sha256(data).hexdigest(); directory.mkdir(parents=True,exist_ok=True)
     target=directory/f'{uuid4()}-{digest[:12]}{suffix}'
+    temp: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(dir=directory,delete=False) as f: f.write(data); temp=Path(f.name)
         os.replace(temp,target)
-    except OSError as error: raise AttachmentError('atomic write failed') from error
+    except OSError as error:
+        # Jangan tinggalkan file temporary ketika atomic replace gagal.
+        if temp is not None and temp.exists():
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+        raise AttachmentError('atomic write failed') from error
     return digest,target
